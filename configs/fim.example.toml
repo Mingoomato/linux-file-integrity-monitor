@@ -1,0 +1,11 @@
+schema_version = 1
+watch_roots = ["/home/user/fim-lab"]
+follow_symlinks = false
+cross_mounts = false
+hash_algorithm = "sha256"
+max_file_bytes = 536870912
+hash_workers = 1
+max_pending_jobs = 1024
+full_rescan_seconds = 3600
+event_max_bytes = 1048576
+state_dir = "./state"

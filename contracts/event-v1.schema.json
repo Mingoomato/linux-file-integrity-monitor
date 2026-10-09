@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/contracts/event-v1.schema.json",
+  "title": "Linux security event v1",
+  "type": "object",
+  "required": ["schema_version", "event_id", "source", "host_id", "observed_at", "kind", "severity", "target", "actor", "evidence", "coverage"],
+  "properties": {
+    "schema_version": {"const": "event.v1"},
+    "event_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "source": {"const": "fim"},
+    "host_id": {"type": "string", "maxLength": 128},
+    "observed_at": {"type": "string", "format": "date-time"},
+    "kind": {"type": "string", "maxLength": 80},
+    "severity": {"enum": ["info", "low", "medium", "high"]},
+    "target": {"type": "object", "required": ["path"], "properties": {"path": {"type": "string", "maxLength": 4096}}},
+    "actor": {"type": "object", "required": ["pid", "attribution"], "properties": {"pid": {"type": ["integer", "null"]}, "start_time_ticks": {"type": ["integer", "null"]}, "attribution": {"const": "unknown"}}},
+    "evidence": {"type": "object"},
+    "coverage": {"type": "object", "required": ["state"], "properties": {"state": {"enum": ["healthy", "degraded", "unsupported", "recovering"]}, "reason": {"type": ["string", "null"]}}}
+  },
+  "additionalProperties": false
+}

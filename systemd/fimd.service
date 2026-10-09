@@ -1,0 +1,23 @@
+[Unit]
+Description=Linux File Integrity Monitor (lab)
+After=local-fs.target
+
+[Service]
+Type=simple
+User=fim
+Group=fim
+ExecStart=/usr/bin/fimctl watch --root /home/fim/lab --events /var/lib/fim/events.ndjson --pidfile /run/fim/fimd.pid
+Restart=on-failure
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ReadWritePaths=/var/lib/fim /run/fim
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target
