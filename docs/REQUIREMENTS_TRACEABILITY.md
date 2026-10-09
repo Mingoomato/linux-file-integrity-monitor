@@ -10,7 +10,7 @@ Code presence is not full requirement verification. The recorded smoke test cove
 | FIM-FR-004 | `scan_dir`, `same_file_state` | FIM-T-006 pending | IMPLEMENTED |
 | FIM-FR-005 | `watch_add`, `add_tree_watches` | FIM-T-004 pending | IN_PROGRESS |
 | FIM-FR-006 | `cmd_watch` | FIM-T-002 pending | IN_PROGRESS |
-| FIM-FR-007 | `cmd_watch` cookie field | FIM-T-003 pending | IN_PROGRESS |
+| FIM-FR-007 | `remember_rename`, `take_rename`, `expire_renames` | `tests/smoke.sh`: paired rename, unmatched move-in, move-out timeout | IMPLEMENTED |
 | FIM-FR-008 | `cmd_watch` overflow event | FIM-T-007 pending | IN_PROGRESS |
 | FIM-FR-009 | — | FIM-T-002 pending | NOT_STARTED |
 | FIM-FR-010 | `compare_rows` | FIM-T-002 pending | IMPLEMENTED |

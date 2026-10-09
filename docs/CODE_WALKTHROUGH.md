@@ -26,7 +26,7 @@ For a file, the flow is `openat` → `fstat` before → `hash_fd` → `fstat` af
 
 The event loop uses `poll` and `read`. Each read can contain multiple variable-length `inotify_event` records, so the cursor advances by `sizeof(*ev) + ev->len`. The watch descriptor selects a base path; the optional event name appends a child. Event masks are mapped to an event kind and passed to `emit_event`.
 
-`emit_event` escapes control characters and JSON quotes in the path, generates a UUID-like event ID through OpenSSL random bytes, formats a UTC timestamp, and writes one complete line with a retry for `EINTR` and partial writes. The actor is explicitly unknown. The code currently exposes rename cookies without pairing them and reports overflow without automatic reconciliation.
+`emit_event` escapes control characters and JSON quotes in the path, generates a UUID-like event ID through OpenSSL random bytes, formats a UTC timestamp, and writes one complete line with a retry for `EINTR` and partial writes. The actor is explicitly unknown. On `IN_MOVED_FROM`, `remember_rename` copies the path and monotonic timestamp into a fixed 256-slot table keyed by cookie. On `IN_MOVED_TO`, `take_rename` removes the matching entry and emits `path.renamed`; a missing cookie emits `file.rename_match_failed`. Entries still pending after the timeout emit `file.rename_timeout`. Overflow is reported, but it still does not trigger automatic reconciliation.
 
 ## 5. Shutdown and lifetime audit
 
@@ -34,4 +34,4 @@ The signal handler sets `stopping`; it does not call `printf`, `free`, SQLite, o
 
 ## 6. Tests and limits
 
-`tests/smoke.sh` creates a temporary tree and exercises a representative baseline/verify/export/watch/shutdown path. Its pass does not cover queue overflow, rename pairing, concurrent mutation, DB corruption, disk-full behavior, or large-tree resource use. The current code has no multithreaded scanner or hash queue; concurrency risk mainly concerns external filesystem changes while a scan is running.
+`tests/smoke.sh` creates a temporary tree and exercises baseline/verify/export/watch/shutdown plus paired rename, move-out timeout, and unmatched move-in paths. Its pass does not cover queue overflow, concurrent mutation, DB corruption, disk-full behavior, or large-tree resource use. The current code has no multithreaded scanner or hash queue; concurrency risk mainly concerns external filesystem changes while a scan is running.

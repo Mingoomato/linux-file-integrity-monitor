@@ -4,7 +4,7 @@
 
 This repository is an educational, read-only observer. It demonstrates how a baseline scan and a best-effort live event stream can complement each other. The engineering intent is to make the limits visible: a hash comparison can identify a current difference, while inotify cannot promise a complete history. Do not describe this code as prevention, actor attribution, or automatic recovery.
 
-The Release build and CTest smoke case passed on the current Linux host. An earlier separate ASan/UBSan smoke run is recorded as passed. This verifies the selected paths in `docs/TEST_RESULTS.md`, not every SRS-01 MUST. Rename correlation, debounce/coalescing, automatic reconciliation, queue-overflow recovery, fault injection, full benchmark, and distribution matrix remain incomplete or unverified. Treat this guide as instruction for the checked-in baseline, with those gaps kept explicit.
+The Release build, CTest smoke case, and a separate ASan/UBSan smoke run passed on the current Linux host. The watcher now keeps a bounded pending-move table, emits a matched rename when cookies pair, and separately records a moved-in unmatched event or a timed-out moved-out event. The smoke suite covers these three paths. This verifies selected paths, not every SRS-01 MUST. Debounce/coalescing, automatic reconciliation after queue overflow/watch failure, fault injection, full benchmark, and distribution matrix remain incomplete or unverified. Treat this guide as instruction for the checked-in implementation, with those gaps kept explicit.
 
 ## Why the subsystems exist
 
@@ -29,16 +29,16 @@ The Release build and CTest smoke case passed on the current Linux host. An earl
 
 ### Live observation
 
-`cmd_watch` creates a nonblocking inotify FD, installs watches for the existing same-device directory tree, opens an append-only event file, and creates a PID file. It calls `poll` with a one-second timeout, reads a batch of `struct inotify_event` records, maps watch descriptor plus child name to a path, then calls `emit_event`. A newly created directory triggers a best-effort recursive watch registration. SIGINT/SIGTERM sets a flag; the loop then removes the PID file, frees watch paths, and closes the log and inotify FDs.
+`cmd_watch` creates a nonblocking inotify FD, installs watches for the existing same-device directory tree, opens an append-only event file, and creates a PID file. It calls `poll` with a one-second timeout, reads a batch of `struct inotify_event` records, maps watch descriptor plus child name to a path, then calls `emit_event`. A newly created directory triggers a best-effort recursive watch registration. `IN_MOVED_FROM` observations enter a fixed-capacity table keyed by the kernel cookie. A matching `IN_MOVED_TO` emits `path.renamed`; an unmatched move-in emits `file.rename_match_failed`; a move-out still pending after two monotonic-clock seconds emits `file.rename_timeout`. Raw moved-from/moved-to records remain in the journal. SIGINT/SIGTERM sets a flag; the loop then removes the PID file, frees watch paths, and closes the log and inotify FDs.
 
-The current watcher reports `IN_Q_OVERFLOW` as degraded and asks the operator to run a full verify. It does not itself rescan or restore healthy coverage. `IN_MOVED_FROM` and `IN_MOVED_TO` expose the kernel cookie but are currently emitted separately; the code does not correlate them into a rename decision.
+The current watcher reports `IN_Q_OVERFLOW` as degraded and asks the operator to run a full verify. It does not itself rescan or restore healthy coverage. Rename decisions are limited to cookies observed by this process before the timeout; a lost side is never inferred from a pathname alone.
 
 ## Ownership, lifetimes, and concurrency
 
 - The scanner owns each allocated relative path after `push_row` succeeds. `free_rows` releases the vector and row paths. A failed allocation or unstable read aborts the scan.
 - `fdopendir` takes ownership of the duplicated FD; `closedir` closes it. The caller retains and closes the original directory FD. Each opened child/file FD is closed in its local scope on the normal path.
 - SQLite statements are finalized after use; SQLite owns bound text because rows use `SQLITE_TRANSIENT`. DB handles are per CLI invocation and closed on completion/error paths.
-- The watcher owns the inotify FD, event-log FD, PID-file lifecycle, and heap copies of watched paths. The kernel owns watch state until the inotify instance is closed.
+- The watcher owns the inotify FD, event-log FD, PID-file lifecycle, heap copies of watched paths, and a fixed 256-entry pending-rename table on its stack. Pending entries contain bounded path buffers and monotonic timestamps; matching or timeout removes an entry. The kernel owns watch state until the inotify instance is closed.
 - The scanner is single-threaded. The watcher has one event loop and no worker queue, so it avoids in-process data races but can fall behind if event processing or disk writes are slow.
 - Signal state is a `volatile sig_atomic_t` flag. The signal handler avoids doing I/O; cleanup happens in ordinary control flow.
 
@@ -46,7 +46,7 @@ The current watcher reports `IN_Q_OVERFLOW` as degraded and asks the operator to
 
 Assumptions: the caller chooses a disposable root; the DB and journal are stored with user-only permissions; the same user is trusted not to alter them; the monitored filesystem supports the expected Linux semantics. Directory FDs, `O_NOFOLLOW`, and pre/post `fstat` reduce specific path and mutation races but do not create an immutable snapshot.
 
-Important failure modes include permission denial, vanished entries, `EMFILE`, I/O errors, an event-log write failure, inotify watch loss, queue overflow, coalesced events, watch registration races, and process termination. A full scan can establish current state after many event losses, but it cannot reconstruct intermediate actions. File paths can reveal personal data. Inotify does not provide a trustworthy PID for the actor.
+Important failure modes include permission denial, vanished entries, `EMFILE`, I/O errors, an event-log write failure, inotify watch loss, queue overflow, coalesced events, watch registration races, pending-rename capacity exhaustion, and process termination. A full scan can establish current state after many event losses, but it cannot reconstruct intermediate actions. File paths can reveal personal data. Inotify does not provide a trustworthy PID for the actor.
 
 ## Alternatives and tradeoffs
 
@@ -60,7 +60,7 @@ Important failure modes include permission denial, vanished entries, `EMFILE`, I
 
 1. Read `docs/ARCHITECTURE.md` and `docs/THREAT_MODEL.md`.
 2. Trace `cmd_init` and `cmd_verify` through scanner → hash → DB/comparison.
-3. Trace one `IN_CLOSE_WRITE` event through `cmd_watch` → `watch_path` → `emit_event`.
+3. Trace a paired move through raw `IN_MOVED_FROM`/`IN_MOVED_TO` records, `remember_rename`, `take_rename`, and the `path.renamed` journal event.
 4. Use `docs/CODE_WALKTHROUGH.md` and `docs/LINUX_INTERNALS_EXPLAINED.md` while reading the source.
 5. Attempt one exercise from `docs/DEBUGGING_EXERCISES.md`; no solution is included in the repository.
 

@@ -74,6 +74,55 @@ do
     [ "$tries" -lt 100 ] || { echo "watch event timeout" >&2; exit 1; }
     tries=$((tries + 1)); sleep 0.05
 done
+mv "$tmp/lab/nested/new-file.txt" "$tmp/lab/nested/renamed-file.txt"
+tries=0
+while ! python3 - "$tmp/events.ndjson" "$tmp/lab/nested/renamed-file.txt" <<'PY'
+import json, os, sys
+path = os.path.realpath(sys.argv[2])
+try:
+    rows = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8")]
+except (FileNotFoundError, json.JSONDecodeError):
+    raise SystemExit(1)
+from_events = [row for row in rows if row.get("kind") == "file.moved_from"]
+to_events = [row for row in rows if row.get("kind") == "file.moved_to" and row.get("target", {}).get("path") == path]
+matched = [row for row in rows if row.get("kind") == "path.renamed" and row.get("target", {}).get("path") == path]
+raise SystemExit(0 if matched and any(a.get("evidence", {}).get("rename_cookie") == matched[-1].get("evidence", {}).get("rename_cookie") for a in from_events) and to_events else 1)
+PY
+do
+    [ "$tries" -lt 100 ] || { echo "rename correlation timeout" >&2; exit 1; }
+    tries=$((tries + 1)); sleep 0.05
+done
+mv "$tmp/lab/nested/renamed-file.txt" "$tmp/moved-outside.txt"
+tries=0
+while ! python3 - "$tmp/events.ndjson" "$tmp/lab/nested/renamed-file.txt" <<'PY'
+import json, os, sys
+path = os.path.realpath(sys.argv[2])
+try:
+    rows = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8")]
+except (FileNotFoundError, json.JSONDecodeError):
+    raise SystemExit(1)
+raise SystemExit(0 if any(row.get("kind") == "file.rename_timeout" and row.get("target", {}).get("path") == path for row in rows) else 1)
+PY
+do
+    [ "$tries" -lt 120 ] || { echo "rename timeout event missing" >&2; exit 1; }
+    tries=$((tries + 1)); sleep 0.05
+done
+printf 'incoming\n' >"$tmp/incoming.txt"
+mv "$tmp/incoming.txt" "$tmp/lab/nested/incoming.txt"
+tries=0
+while ! python3 - "$tmp/events.ndjson" "$tmp/lab/nested/incoming.txt" <<'PY'
+import json, os, sys
+path = os.path.realpath(sys.argv[2])
+try:
+    rows = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8")]
+except (FileNotFoundError, json.JSONDecodeError):
+    raise SystemExit(1)
+raise SystemExit(0 if any(row.get("kind") == "file.rename_match_failed" and row.get("target", {}).get("path") == path for row in rows) else 1)
+PY
+do
+    [ "$tries" -lt 100 ] || { echo "unmatched rename event missing" >&2; exit 1; }
+    tries=$((tries + 1)); sleep 0.05
+done
 "$bin" stop --pidfile "$tmp/watch.pid"
 wait "$watch_pid"
 watch_pid=

@@ -22,7 +22,7 @@ Important semantics:
 - `IN_Q_OVERFLOW` means events were dropped. The only safe interpretation is degraded historical coverage followed by a fresh state reconciliation.
 - Watching pathnames creates race windows when directories are renamed/replaced. An inotify watch follows the watched inode, not a promise that the pathname remains the same object.
 
-This repository implements event emission and an overflow warning. Automatic full reconciliation and coverage restoration are not yet implemented.
+The watcher keeps a fixed-capacity table of pending `IN_MOVED_FROM` cookies with monotonic timestamps. A matching `IN_MOVED_TO` emits a paired rename event; a move-in without a matching cookie and a move-out that exceeds the timeout are recorded as different uncertain outcomes. This preserves raw evidence and avoids inventing a rename. The table is bounded to 256 entries. Queue overflow still only marks coverage degraded and instructs the operator to perform a full verification; automatic reconciliation and coverage restoration are not implemented.
 
 ## SQLite durability boundary
 

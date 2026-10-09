@@ -24,6 +24,8 @@
 #define EVENT_MAX_BYTES (1024U * 1024U)
 #define MAX_DEPTH 128
 #define EVENT_BUFFER 65536
+#define MAX_PENDING_RENAMES 256U
+#define RENAME_TIMEOUT_SECONDS 2
 
 struct file_row {
     char *path;
@@ -35,10 +37,22 @@ struct file_row {
 struct rows { struct file_row *v; size_t n, cap; };
 struct watch_row { int wd; char *path; };
 struct watches { struct watch_row *v; size_t n, cap; };
+struct pending_rename {
+    uint32_t cookie;
+    char path[PATH_MAX];
+    struct timespec observed;
+};
+struct pending_renames {
+    struct pending_rename rows[MAX_PENDING_RENAMES];
+    size_t n;
+};
 
 static volatile sig_atomic_t stopping;
 
 static void on_signal(int sig) { (void)sig; stopping = 1; }
+
+static int emit_event(int fd, const char *kind, const char *path, const char *coverage,
+                      uint32_t mask, uint32_t cookie);
 
 static int fail(const char *message) {
     fprintf(stderr, "fimctl: %s: %s\n", message, strerror(errno));
@@ -368,6 +382,49 @@ static const char *watch_path(const struct watches *ws, int wd) {
     return NULL;
 }
 
+static int remember_rename(struct pending_renames *pending, uint32_t cookie,
+                           const char *path) {
+    if (cookie == 0U || pending->n == MAX_PENDING_RENAMES) { errno = ENOSPC; return -1; }
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return -1;
+    struct pending_rename *row = &pending->rows[pending->n];
+    int n = snprintf(row->path, sizeof(row->path), "%s", path);
+    if (n < 0 || (size_t)n >= sizeof(row->path)) { errno = ENAMETOOLONG; return -1; }
+    row->cookie = cookie;
+    row->observed = now;
+    ++pending->n;
+    return 0;
+}
+
+static int take_rename(struct pending_renames *pending, uint32_t cookie) {
+    for (size_t i = 0; i < pending->n; ++i) {
+        if (pending->rows[i].cookie != cookie) continue;
+        if (i + 1U < pending->n)
+            memmove(&pending->rows[i], &pending->rows[i + 1U],
+                    (pending->n - i - 1U) * sizeof(pending->rows[0]));
+        --pending->n;
+        return 1;
+    }
+    return 0;
+}
+
+static int expire_renames(struct pending_renames *pending, int logfd) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return -1;
+    for (size_t i = 0; i < pending->n;) {
+        time_t age = now.tv_sec - pending->rows[i].observed.tv_sec;
+        if (now.tv_nsec < pending->rows[i].observed.tv_nsec) --age;
+        if (age < RENAME_TIMEOUT_SECONDS) { ++i; continue; }
+        if (emit_event(logfd, "file.rename_timeout", pending->rows[i].path,
+                       "healthy", IN_MOVED_FROM, pending->rows[i].cookie) != 0) return -1;
+        if (i + 1U < pending->n)
+            memmove(&pending->rows[i], &pending->rows[i + 1U],
+                    (pending->n - i - 1U) * sizeof(pending->rows[0]));
+        --pending->n;
+    }
+    return 0;
+}
+
 static int add_tree_watches(int inofd, struct watches *ws, const char *path,
                             dev_t root_dev, unsigned depth) {
     if (depth > MAX_DEPTH) { errno = ELOOP; return -1; }
@@ -440,6 +497,7 @@ static int cmd_watch(const char *root_arg, const char *events, const char *pidfi
     int inofd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
     if (inofd < 0) return fail("inotify_init1");
     struct watches ws = {0};
+    struct pending_renames renames = {0};
     int rootfd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     struct stat rootst;
     if (rootfd < 0 || fstat(rootfd, &rootst) != 0) {
@@ -463,7 +521,10 @@ static int cmd_watch(const char *root_arg, const char *events, const char *pidfi
         int ready = poll(&p, 1, 1000);
         if (ready < 0 && errno == EINTR) continue;
         if (ready < 0) break;
-        if (ready == 0) continue;
+        if (ready == 0) {
+            if (expire_renames(&renames, logfd) != 0) { stopping = 1; break; }
+            continue;
+        }
         ssize_t n = read(inofd, buf, sizeof(buf));
         if (n < 0 && (errno == EAGAIN || errno == EINTR)) continue;
         if (n < 0) break;
@@ -471,7 +532,9 @@ static int cmd_watch(const char *root_arg, const char *events, const char *pidfi
             struct inotify_event *ev = (struct inotify_event *)(void *)(buf + off);
             const char *base = watch_path(&ws, ev->wd);
             if (ev->mask & IN_Q_OVERFLOW) {
-                emit_event(logfd, "coverage.degraded", root, "degraded", ev->mask, 0);
+                if (emit_event(logfd, "coverage.degraded", root, "degraded", ev->mask, 0) != 0) {
+                    stopping = 1; break;
+                }
                 fputs("coverage degraded: inotify queue overflow; run fimctl verify --full\n", stderr);
             } else if (base) {
                 char full[PATH_MAX];
@@ -487,6 +550,23 @@ static int cmd_watch(const char *root_arg, const char *events, const char *pidfi
                     if (emit_event(logfd, kind, full, "healthy", ev->mask, ev->cookie) != 0) {
                         stopping = 1; break;
                     }
+                    if (ev->mask & IN_MOVED_FROM) {
+                        if (remember_rename(&renames, ev->cookie, full) != 0 &&
+                            emit_event(logfd, "file.rename_match_failed", full, "degraded",
+                                       ev->mask, ev->cookie) != 0) {
+                            stopping = 1; break;
+                        }
+                    } else if (ev->mask & IN_MOVED_TO) {
+                        if (take_rename(&renames, ev->cookie)) {
+                            if (emit_event(logfd, "path.renamed", full, "healthy",
+                                           ev->mask, ev->cookie) != 0) {
+                                stopping = 1; break;
+                            }
+                        } else if (emit_event(logfd, "file.rename_match_failed", full,
+                                              "degraded", ev->mask, ev->cookie) != 0) {
+                            stopping = 1; break;
+                        }
+                    }
                     if ((ev->mask & IN_CREATE) && (ev->mask & IN_ISDIR))
                         (void)add_tree_watches(inofd, &ws, full, rootst.st_dev, 0);
                 }
@@ -496,6 +576,7 @@ static int cmd_watch(const char *root_arg, const char *events, const char *pidfi
             }
             off += sizeof(*ev) + ev->len;
         }
+        if (expire_renames(&renames, logfd) != 0) { stopping = 1; break; }
     }
     unlink(pidfile);
     for (size_t i = 0; i < ws.n; ++i) free(ws.v[i].path);

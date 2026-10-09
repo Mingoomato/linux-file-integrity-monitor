@@ -19,22 +19,22 @@ These exercises are intentionally unsolved. Attempt one before asking for a walk
 
 **Acceptance:** The test is repeatable, and its output distinguishes a failed watch from a quiet directory.
 
-## Exercise 2 — Pair a rename without inventing certainty
+## Exercise 2 — Coalesce event bursts while preserving evidence
 
-**Goal:** Extend event handling to correlate `IN_MOVED_FROM`/`IN_MOVED_TO` cookies within a bounded time.
+**Goal:** Reduce redundant downstream work during rapid writes without losing the evidence needed to explain the observed burst.
 
-**Starting points:** `struct inotify_event`, the cookie field in `emit_event`, the `cmd_watch` event loop, and the rename section of `inotify(7)`.
+**Starting points:** `cmd_watch`, `emit_event`, the `coverage` object in event.v1, and the `IN_CLOSE_WRITE`/`IN_ATTRIB` masks in `inotify(7)`.
 
 **Tasks:**
 
-1. Design a bounded pending-move table keyed by cookie.
-2. Decide how to represent a move out of scope, move into scope, a missing pair, and timeout.
-3. Add tests for a paired rename, a missing peer, a cookie timeout, and a duplicate/zero cookie.
-4. Ensure timeout means “unpaired observation,” not a fabricated rename.
+1. Generate a burst of write and metadata events for one fixture file.
+2. Define a bounded coalescing window and an output record that preserves first/last observation times and raw event count.
+3. Add a deterministic test for a burst, a quiet period, and queue pressure.
+4. Decide how to flush pending records during shutdown and how to report dropped/coalesced counts.
 
-**Constraints:** Bound memory and event delay. Preserve raw event evidence and keep actor attribution unknown.
+**Constraints:** Bound memory and event delay. Do not hash or modify monitored files. Keep actor attribution unknown and make dropped evidence visible.
 
-**Acceptance:** Every emitted decision can be traced to original kernel masks and cookie; no unmatched event is mislabeled as a confirmed rename.
+**Acceptance:** Tests show a bounded summary of the burst, retain its time/count range, and distinguish coalescing from lost events.
 
 ## Exercise 3 — Stable file hashing under concurrent mutation
 

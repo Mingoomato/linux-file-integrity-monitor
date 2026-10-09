@@ -8,4 +8,4 @@ Run from a disposable Linux environment after dependencies are installed.
 - Exercise unstable files, permission denial, corrupt/future-version databases, existing database refusal, event-log ENOSPC, inotify overflow, watch registration failure, and SIGTERM.
 - Run the 10k-file benchmark only after measuring and recording machine/kernel/filesystem details.
 
-The smoke test has been run; the listed edge, fault-injection, and benchmark scenarios remain pending. Privileged tests require a disposable VM.
+The current smoke test covers an in-root cookie-paired rename, a move into the root with no observed peer, and an out-of-root move whose peer times out. These provide focused coverage for FIM-T-003. The remaining listed edge, fault-injection, and benchmark scenarios remain pending. Privileged tests require a disposable VM.
