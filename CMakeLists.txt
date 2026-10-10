@@ -7,10 +7,11 @@ set(CMAKE_C_EXTENSIONS ON)
 
 find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 find_package(SQLite3 REQUIRED)
+find_package(Threads REQUIRED)
 
 add_executable(fimctl src/fimctl.c)
 target_compile_options(fimctl PRIVATE -Wall -Wextra -Wpedantic -Werror)
-target_link_libraries(fimctl PRIVATE OpenSSL::Crypto SQLite3::SQLite3)
+target_link_libraries(fimctl PRIVATE OpenSSL::Crypto SQLite3::SQLite3 Threads::Threads)
 install(TARGETS fimctl RUNTIME DESTINATION bin)
 
 include(CTest)

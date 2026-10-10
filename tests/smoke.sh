@@ -58,6 +58,15 @@ rc=$?
 set -e
 [ "$rc" -eq 1 ]
 [ ! -e "$tmp/malformed-events.ndjson" ]
+if [ -c /dev/full ]; then
+    set +e
+    "$bin" watch --root "$tmp/lab" --db "$tmp/state.sqlite" --events /dev/full \
+        --pidfile "$tmp/full-log.pid" >"$tmp/full-log.out" 2>&1
+    rc=$?
+    set -e
+    [ "$rc" -eq 1 ] || { echo "event journal write failure returned status $rc" >&2; exit 1; }
+    [ ! -e "$tmp/full-log.pid" ]
+fi
 
 printf 'changed content\n' >"$tmp/lab/nested/quoted\"name.txt"
 set +e
@@ -149,6 +158,30 @@ do
     [ "$tries" -lt 100 ] || { echo "watch event timeout" >&2; exit 1; }
     tries=$((tries + 1)); sleep 0.05
 done
+python3 - "$tmp/lab/nested" <<'PY'
+import pathlib, sys
+root = pathlib.Path(sys.argv[1])
+for index in range(1100):
+    (root / f"queue-load-{index:04d}.txt").write_bytes(b"")
+PY
+tries=0
+while ! python3 - "$tmp/events.ndjson" "$tmp/lab/nested" <<'PY'
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[2]).resolve()
+expected = {f"queue-load-{index:04d}.txt" for index in range(1100)}
+try:
+    rows = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8")]
+except (FileNotFoundError, json.JSONDecodeError):
+    raise SystemExit(1)
+observed = {pathlib.Path(row.get("target", {}).get("path", "")).name
+            for row in rows if row.get("kind") == "file.created" and
+            pathlib.Path(row.get("target", {}).get("path", "")).parent == root}
+raise SystemExit(0 if expected <= observed else 1)
+PY
+do
+    [ "$tries" -lt 200 ] || { echo "hash worker queue stress lost a file observation" >&2; exit 1; }
+    tries=$((tries + 1)); sleep 0.05
+done
 printf 'reconcile this state\n' >"$tmp/lab/nested/reconcile-marker.txt"
 chmod 600 "$tmp/lab/metadata.txt"
 rm "$tmp/lab/nested/quoted\"name.txt"
@@ -190,23 +223,28 @@ import hashlib, json, os, sys
 marker = os.path.realpath(sys.argv[2])
 metadata = os.path.realpath(sys.argv[3])
 rows = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8")]
-assert any(row.get("kind") == "file.created" and
-           row.get("target", {}).get("path") == marker and
-           row.get("evidence", {}).get("after_sha256") ==
-           hashlib.sha256(b"reconcile this state\n").hexdigest()
-           for row in rows)
-assert any(row.get("kind") == "file.deleted" and
-           row.get("target", {}).get("path", "").endswith('/nested/quoted"name.txt') and
-           row.get("evidence", {}).get("before_sha256") ==
-           hashlib.sha256(b"changed content\n").hexdigest()
-           for row in rows)
-assert any(row.get("kind") == "file.metadata_changed" and
-           row.get("target", {}).get("path") == metadata and
-           row.get("evidence", {}).get("before_sha256") ==
-           hashlib.sha256(b"metadata fixture\n").hexdigest() and
-           row.get("evidence", {}).get("after_sha256") ==
-           hashlib.sha256(b"metadata fixture\n").hexdigest()
-           for row in rows)
+created = any(row.get("kind") == "file.created" and
+              row.get("target", {}).get("path") == marker and
+              row.get("evidence", {}).get("after_sha256") ==
+              hashlib.sha256(b"reconcile this state\n").hexdigest()
+              for row in rows)
+deleted = any(row.get("kind") == "file.deleted" and
+              row.get("target", {}).get("path", "").endswith('/nested/quoted"name.txt') and
+              row.get("evidence", {}).get("before_sha256") ==
+              hashlib.sha256(b"changed content\n").hexdigest()
+              for row in rows)
+metadata_changed = any(row.get("kind") == "file.metadata_changed" and
+                      row.get("target", {}).get("path") == metadata and
+                      row.get("evidence", {}).get("before_sha256") ==
+                      hashlib.sha256(b"metadata fixture\n").hexdigest() and
+                      row.get("evidence", {}).get("after_sha256") ==
+                      hashlib.sha256(b"metadata fixture\n").hexdigest()
+                      for row in rows)
+if not (created and deleted and metadata_changed):
+    print("missing settled hash event:", created, deleted, metadata_changed, file=sys.stderr)
+    print([(row.get("kind"), row.get("target", {}).get("path"), row.get("evidence"))
+           for row in rows], file=sys.stderr)
+    raise SystemExit(1)
 PY
 tries=0
 while ! python3 - "$tmp/events.ndjson" "$tmp/lab/nested/reconcile-marker.txt" <<'PY'

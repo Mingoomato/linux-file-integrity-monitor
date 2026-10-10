@@ -24,7 +24,7 @@ No answers are included. Use the code, SRS, and executed evidence to defend each
 15. How does the periodic verifier detect current state after an inotify event was missed? What data does it compare and what does it leave unchanged?
 16. What happens if the periodic scan fails? Which snapshot remains authoritative for the next attempt?
 17. If `IN_MOVED_FROM` arrives without `IN_MOVED_TO`, what can be concluded, and how is the uncertainty represented?
-18. How would you test an event-log `ENOSPC` failure without filling the host filesystem?
+18. How would you test an event-log `ENOSPC` failure without filling the host filesystem? What does the `/dev/full` test prove, and what does it leave untested?
 
 ## Security and Linux semantics
 
@@ -38,7 +38,7 @@ No answers are included. Use the code, SRS, and executed evidence to defend each
 ## Design tradeoffs
 
 25. Compare inotify, fanotify, and periodic scanning for this read-only lab goal.
-26. What would a bounded hash worker queue improve? What backpressure, cancellation, ownership, shutdown, and stale-path problems would it introduce?
+26. Trace one hash job through submission, worker completion, sequence-ordered commit, and free. Why can a finished later sequence wait, and what happens when the 1,024-job bound is reached?
 27. How could a filesystem snapshot change the consistency model? Which portability costs follow?
 28. What evidence is required before claiming `coverage=healthy` after watch loss or queue overflow?
 29. The smoke test passes. Which SRS-01 requirements remain incomplete, and what is the next highest-value verification gate?

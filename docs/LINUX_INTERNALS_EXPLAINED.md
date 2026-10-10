@@ -29,7 +29,7 @@ Important semantics:
 
 A 100 ms quiet window is measured with `CLOCK_MONOTONIC`; the event record's first/last observation times use `CLOCK_REALTIME` nanoseconds. The bounded coalescer preserves the OR-ed mask and raw signal count. When the quiet window expires, the event loop walks from a persistent root directory FD with `openat`, `O_DIRECTORY`, and `O_NOFOLLOW`, then opens the final file with `O_NOFOLLOW | O_NONBLOCK`. `O_NONBLOCK` prevents a path replaced by a FIFO from hanging the watcher before it checks the file type. The watcher hashes a same-device regular file and compares it with the current in-memory row. A baseline difference is reported with before/after SHA-256 values; a failed hash becomes `file.unknown` with `error_errno`.
 
-The work is synchronous on the event-loop thread. There is no worker queue, so the fixed path table bounds pending notifications but does not bound time spent hashing one large file. A worker design would need backpressure and a policy for paths that change again while a job is pending.
+The event loop submits copied events to two pthread workers through a mutex/condition-variable queue. At most 1,024 jobs may be queued, active, or awaiting commit. Each job has a monotonic sequence number. Workers hash independently, then insert completed results in sequence order; the main loop alone compares with and updates the in-memory snapshot and writes the journal. An `eventfd` notifies `poll` when work completes. If the bound is full, the event loop waits while committing completed jobs, which bounds memory but can delay reading inotify. A resulting kernel overflow is recovered by a full current-state scan. Worker threads are joined before shared root resources are closed.
 
 The interval option accepts 1 to 86,400 seconds and defaults to 3,600 seconds. Periodic verification scans the complete tree and compares it with the last successful in-memory snapshot. It can notice current-state changes after a missed inotify event. It does not update the SQLite baseline or reconstruct the missed event sequence. A scan failure emits degraded coverage and keeps the previous snapshot.
 
@@ -41,12 +41,13 @@ WAL allows readers and a writer to make progress with separate log and database 
 
 FDs are process resources and must close on all exits. `fdopendir` takes ownership of its FD; `dup` keeps the directory FD available for `fstatat` and `openat`. `EINTR` may require retry for I/O calls; `EAGAIN` is expected when a nonblocking inotify FD has no queued event and can also signal a file changed during hashing. `ENOSPC` on the journal is evidence loss, not success. The watcher stops on journal write failure; an explicit aggregate lost-event counter is not implemented.
 
-The row snapshot, watch-path strings, and coalescer storage are process-owned. Recovery frees old watch-path storage and replaces snapshot rows only after a successful scan. The event loop is single-threaded, so there are no concurrent access races inside the monitor, but slow scans can delay notification reads.
+The row snapshot, watch-path strings, coalescer, and job objects are process-owned. The main loop owns the snapshot and journal; worker threads own only the hash operation and its result until it is placed on the completion list. Mutex/condition-variable synchronization protects linked queues, and the sequence number keeps snapshot updates ordered. Recovery drains outstanding jobs before replacing snapshot rows. `eventfd` is polled beside inotify. ThreadSanitizer passed the smoke test, though broader saturation and failure-injection coverage remains open.
 
 ## Official references
 
 - [`inotify(7)`](https://man7.org/linux/man-pages/man7/inotify.7.html), [`inotify_add_watch(2)`](https://man7.org/linux/man-pages/man2/inotify_add_watch.2.html), [`inotify_init1(2)`](https://man7.org/linux/man-pages/man2/inotify_init1.2.html)
 - [`openat(2)`](https://man7.org/linux/man-pages/man2/openat.2.html), [`openat2(2)`](https://man7.org/linux/man-pages/man2/openat2.2.html), [`stat(2)`](https://man7.org/linux/man-pages/man2/stat.2.html)
-- [`poll(2)`](https://man7.org/linux/man-pages/man2/poll.2.html), [`read(2)`](https://man7.org/linux/man-pages/man2/read.2.html), [`fdopendir(3)`](https://man7.org/linux/man-pages/man3/fdopendir.3.html)
+- [`poll(2)`](https://man7.org/linux/man-pages/man2/poll.2.html), [`eventfd(2)`](https://man7.org/linux/man-pages/man2/eventfd.2.html), [`read(2)`](https://man7.org/linux/man-pages/man2/read.2.html), [`fdopendir(3)`](https://man7.org/linux/man-pages/man3/fdopendir.3.html)
+- [`pthreads(7)`](https://man7.org/linux/man-pages/man7/pthreads.7.html), [`pthread_cond_wait(3)`](https://man7.org/linux/man-pages/man3/pthread_cond_wait.3.html)
 - [SQLite WAL](https://www.sqlite.org/wal.html), [SQLite atomic commit](https://www.sqlite.org/atomiccommit.html)
 - [OpenSSL EVP digest API](https://docs.openssl.org/3.0/man3/EVP_DigestInit/)

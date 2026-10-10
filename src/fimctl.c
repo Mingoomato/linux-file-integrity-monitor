@@ -5,14 +5,17 @@
 #include <limits.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
+#include <pthread.h>
 #include <poll.h>
 #include <signal.h>
 #include <sqlite3.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/inotify.h>
+#include <sys/eventfd.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -30,6 +33,8 @@
 #define RENAME_TIMEOUT_SECONDS 2
 #define DEFAULT_VERIFY_INTERVAL_SECONDS 3600U
 #define MAX_VERIFY_INTERVAL_SECONDS 86400U
+#define HASH_WORKER_COUNT 2U
+#define MAX_PENDING_HASH_JOBS 1024U
 
 struct file_row {
     char *path;
@@ -61,11 +66,40 @@ struct event_batch {
     size_t n;
     unsigned int window_ms;
 };
+struct hash_job {
+    uint64_t sequence;
+    struct pending_file_event event;
+    char relative[PATH_MAX];
+    char coverage[16];
+    int scan_rc;
+    int error_errno;
+    struct file_row current;
+    struct hash_job *next;
+};
+struct hash_pool {
+    pthread_t workers[HASH_WORKER_COUNT];
+    unsigned int worker_count;
+    pthread_mutex_t mutex;
+    pthread_cond_t work_ready;
+    struct hash_job *work_head, *work_tail, *done_head;
+    size_t outstanding;
+    uint64_t next_sequence;
+    int completion_fd;
+    int stopping;
+    atomic_int worker_error;
+    int consumer_error;
+    int mutex_ready;
+    int condition_ready;
+    int rootfd;
+    dev_t root_dev;
+};
 struct watch_context {
     const char *root;
     int rootfd;
     dev_t root_dev;
     struct rows *snapshot;
+    struct hash_pool *hash_pool;
+    uint64_t *next_commit_sequence;
 };
 
 static volatile sig_atomic_t stopping;
@@ -323,7 +357,122 @@ static int scan_relative_file(int rootfd, dev_t root_dev, const char *relative,
     return result;
 }
 
+static void free_hash_job(struct hash_job *job) {
+    if (!job) return;
+    free(job->current.path);
+    free(job);
+}
+
+static void notify_hash_completion(struct hash_pool *pool) {
+    uint64_t one = 1U;
+    ssize_t n;
+    do { n = write(pool->completion_fd, &one, sizeof(one)); }
+    while (n < 0 && errno == EINTR);
+    if (n != (ssize_t)sizeof(one))
+        atomic_store_explicit(&pool->worker_error, n < 0 ? errno : EIO, memory_order_release);
+}
+
+static void *hash_worker_main(void *opaque) {
+    struct hash_pool *pool = opaque;
+    for (;;) {
+        if (pthread_mutex_lock(&pool->mutex) != 0) return NULL;
+        while (!pool->work_head && !pool->stopping) {
+            int rc = pthread_cond_wait(&pool->work_ready, &pool->mutex);
+            if (rc != 0) {
+                pool->worker_error = rc;
+                pool->stopping = 1;
+                (void)pthread_cond_broadcast(&pool->work_ready);
+                (void)pthread_mutex_unlock(&pool->mutex);
+                notify_hash_completion(pool);
+                return NULL;
+            }
+        }
+        if (!pool->work_head && pool->stopping) {
+            (void)pthread_mutex_unlock(&pool->mutex);
+            return NULL;
+        }
+        struct hash_job *job = pool->work_head;
+        pool->work_head = job->next;
+        if (!pool->work_head) pool->work_tail = NULL;
+        (void)pthread_mutex_unlock(&pool->mutex);
+
+        job->current = (struct file_row){0};
+        job->scan_rc = -1;
+        job->error_errno = EIO;
+        for (unsigned int attempt = 0U; attempt < 3U; ++attempt) {
+            errno = 0;
+            job->scan_rc = scan_relative_file(pool->rootfd, pool->root_dev,
+                                              job->relative, &job->current);
+            job->error_errno = errno ? errno : EIO;
+            if (job->scan_rc >= 0 || job->error_errno != EAGAIN) break;
+            const struct timespec delay = { .tv_sec = 0, .tv_nsec = 10000000L };
+            (void)nanosleep(&delay, NULL);
+        }
+
+        if (pthread_mutex_lock(&pool->mutex) != 0) {
+            atomic_store_explicit(&pool->worker_error, EDEADLK, memory_order_release);
+            free_hash_job(job);
+            notify_hash_completion(pool);
+            return NULL;
+        }
+        struct hash_job **slot = &pool->done_head;
+        while (*slot && (*slot)->sequence < job->sequence) slot = &(*slot)->next;
+        job->next = *slot;
+        *slot = job;
+        (void)pthread_mutex_unlock(&pool->mutex);
+        notify_hash_completion(pool);
+    }
+}
+
+static void hash_pool_stop(struct hash_pool *pool) {
+    if (pool->mutex_ready) {
+        (void)pthread_mutex_lock(&pool->mutex);
+        pool->stopping = 1;
+        if (pool->condition_ready) (void)pthread_cond_broadcast(&pool->work_ready);
+        (void)pthread_mutex_unlock(&pool->mutex);
+    }
+    for (unsigned int i = 0U; i < pool->worker_count; ++i)
+        (void)pthread_join(pool->workers[i], NULL);
+    struct hash_job *job = pool->work_head;
+    while (job) { struct hash_job *next = job->next; free_hash_job(job); job = next; }
+    job = pool->done_head;
+    while (job) { struct hash_job *next = job->next; free_hash_job(job); job = next; }
+    if (pool->condition_ready) (void)pthread_cond_destroy(&pool->work_ready);
+    if (pool->mutex_ready) (void)pthread_mutex_destroy(&pool->mutex);
+    if (pool->completion_fd >= 0) close(pool->completion_fd);
+    memset(pool, 0, sizeof(*pool));
+    pool->completion_fd = -1;
+}
+
+static int hash_pool_start(struct hash_pool *pool, int rootfd, dev_t root_dev) {
+    memset(pool, 0, sizeof(*pool));
+    pool->completion_fd = -1;
+    pool->rootfd = rootfd;
+    pool->root_dev = root_dev;
+    pool->next_sequence = 1U;
+    atomic_init(&pool->worker_error, 0);
+    pool->completion_fd = eventfd(0U, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (pool->completion_fd < 0) return -1;
+    int rc = pthread_mutex_init(&pool->mutex, NULL);
+    if (rc != 0) { errno = rc; hash_pool_stop(pool); return -1; }
+    pool->mutex_ready = 1;
+    rc = pthread_cond_init(&pool->work_ready, NULL);
+    if (rc != 0) { errno = rc; hash_pool_stop(pool); return -1; }
+    pool->condition_ready = 1;
+    for (unsigned int i = 0U; i < HASH_WORKER_COUNT; ++i) {
+        rc = pthread_create(&pool->workers[i], NULL, hash_worker_main, pool);
+        if (rc != 0) { errno = rc; hash_pool_stop(pool); return -1; }
+        ++pool->worker_count;
+    }
+    return 0;
+}
+
 static size_t row_index(const struct rows *rows, const char *path, int *found) {
+    if (!found) { errno = EINVAL; return 0U; }
+    *found = 0;
+    if (!rows || !path) { errno = EINVAL; return 0U; }
+    if (rows->n == 0U) return 0U;
+    if (!rows->v) { errno = EIO; return 0U; }
     size_t low = 0U, high = rows->n;
     while (low < high) {
         size_t middle = low + (high - low) / 2U;
@@ -336,8 +485,12 @@ static size_t row_index(const struct rows *rows, const char *path, int *found) {
 }
 
 static int rows_upsert(struct rows *rows, struct file_row *row) {
+    if (!rows || !row || !row->path || (rows->n > 0U && !rows->v)) {
+        errno = EINVAL; return -1;
+    }
     int found = 0;
     size_t index = row_index(rows, row->path, &found);
+    if (found && (!rows->v || index >= rows->n)) { errno = EIO; return -1; }
     if (found) {
         free(rows->v[index].path);
         rows->v[index] = *row;
@@ -357,11 +510,13 @@ static int rows_upsert(struct rows *rows, struct file_row *row) {
     return 0;
 }
 
-static void rows_remove(struct rows *rows, size_t index) {
+static int rows_remove(struct rows *rows, size_t index) {
+    if (!rows || !rows->v || index >= rows->n) { errno = EINVAL; return -1; }
     free(rows->v[index].path);
     if (index + 1U < rows->n)
         memmove(&rows->v[index], &rows->v[index + 1U], (rows->n - index - 1U) * sizeof(rows->v[0]));
     --rows->n;
+    return 0;
 }
 
 static int db_open(const char *path, sqlite3 **db) {
@@ -786,6 +941,165 @@ static int emit_coverage_event(int fd, const char *path, const char *state,
                            0U, 0U, NULL, NULL, 0);
 }
 
+static int commit_hash_job(struct hash_job *job, int logfd,
+                           const struct watch_context *ctx) {
+    if (!ctx->snapshot || (ctx->snapshot->n > 0U && !ctx->snapshot->v)) {
+        errno = EIO; return -1;
+    }
+    int found = 0;
+    size_t old_index = row_index(ctx->snapshot, job->relative, &found);
+    if (found && (!ctx->snapshot->v || old_index >= ctx->snapshot->n)) {
+        errno = EIO; return -1;
+    }
+    char before_hash[65];
+    const char *before_sha256 = NULL;
+    if (found) {
+        memcpy(before_hash, ctx->snapshot->v[old_index].hash, sizeof(before_hash));
+        before_sha256 = before_hash;
+    }
+    if (job->scan_rc < 0) {
+        const char *reason = job->error_errno == EAGAIN
+            ? "unstable_file_retry_exhausted" : "file_hash_failed";
+        return emit_event_full(logfd, "file.unknown", job->event.path, "degraded",
+                               job->event.mask, 0U, reason, 0, job->event.count,
+                               job->event.first_realtime_ns, job->event.last_realtime_ns,
+                               before_sha256, NULL, job->error_errno);
+    }
+
+    const char *kind = NULL;
+    const char *after_sha256 = job->scan_rc == 0 ? job->current.hash : NULL;
+    if (job->scan_rc == 1) {
+        if (found) {
+            if (rows_remove(ctx->snapshot, old_index) != 0) return -1;
+            kind = "file.deleted";
+        }
+        else kind = "file.unchanged";
+    } else if (!found) {
+        kind = "file.created";
+        if (rows_upsert(ctx->snapshot, &job->current) != 0) return -1;
+    } else {
+        const struct file_row *old = &ctx->snapshot->v[old_index];
+        if (strcmp(old->hash, job->current.hash) != 0 || old->size != job->current.size)
+            kind = "file.modified";
+        else if (rows_differ(old, &job->current))
+            kind = "file.metadata_changed";
+        else
+            kind = "file.unchanged";
+        if (rows_upsert(ctx->snapshot, &job->current) != 0) return -1;
+    }
+    return emit_event_full(logfd, kind, job->event.path, job->coverage,
+                           job->event.mask, 0U, NULL, 0, job->event.count,
+                           job->event.first_realtime_ns, job->event.last_realtime_ns,
+                           before_sha256, after_sha256, 0);
+}
+
+static int hash_pool_reap_ready(struct hash_pool *pool, uint64_t *next_commit_sequence,
+                                int logfd, const struct watch_context *ctx,
+                                size_t *reaped) {
+    *reaped = 0U;
+    for (;;) {
+        int rc = pthread_mutex_lock(&pool->mutex);
+        if (rc != 0) { errno = rc; return -1; }
+        int worker_error = atomic_load_explicit(&pool->worker_error, memory_order_acquire);
+        if (worker_error) {
+            (void)pthread_mutex_unlock(&pool->mutex);
+            errno = worker_error;
+            return -1;
+        }
+        struct hash_job *job = pool->done_head;
+        if (!job || job->sequence != *next_commit_sequence) {
+            (void)pthread_mutex_unlock(&pool->mutex);
+            return 0;
+        }
+        pool->done_head = job->next;
+        job->next = NULL;
+        (void)pthread_mutex_unlock(&pool->mutex);
+
+        int commit_rc = commit_hash_job(job, logfd, ctx);
+        free_hash_job(job);
+        if (pool->outstanding > 0U) --pool->outstanding;
+        if (commit_rc != 0) { pool->consumer_error = 1; return -1; }
+        if (*next_commit_sequence == UINT64_MAX) {
+            pool->consumer_error = 1; errno = EOVERFLOW; return -1;
+        }
+        ++*next_commit_sequence;
+        ++*reaped;
+    }
+}
+
+static int hash_pool_consume_notification(struct hash_pool *pool) {
+    uint64_t completions;
+    for (;;) {
+        ssize_t n = read(pool->completion_fd, &completions, sizeof(completions));
+        if (n == (ssize_t)sizeof(completions)) return 0;
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && errno == EAGAIN) return 0;
+        if (n >= 0) errno = EIO;
+        return -1;
+    }
+}
+
+static int hash_pool_wait_for_completion(struct hash_pool *pool) {
+    struct pollfd pfd = { .fd = pool->completion_fd, .events = POLLIN };
+    for (;;) {
+        int rc = poll(&pfd, 1, 1000);
+        if (rc < 0 && errno == EINTR) continue;
+        if (rc < 0) return -1;
+        if (rc == 0) return 0;
+        if ((pfd.revents & POLLIN) && hash_pool_consume_notification(pool) == 0) return 0;
+        errno = EIO;
+        return -1;
+    }
+}
+
+static int hash_pool_submit(struct hash_pool *pool, struct hash_job *job, int logfd,
+                            const struct watch_context *ctx) {
+    if (pool->consumer_error) { errno = EIO; return -1; }
+    if (pool->next_sequence == UINT64_MAX) { errno = EOVERFLOW; return -1; }
+    while (pool->outstanding >= MAX_PENDING_HASH_JOBS) {
+        size_t reaped = 0U;
+        if (hash_pool_reap_ready(pool, ctx->next_commit_sequence, logfd, ctx, &reaped) != 0)
+            return -1;
+        if (pool->outstanding < MAX_PENDING_HASH_JOBS) break;
+        if (hash_pool_wait_for_completion(pool) != 0) return -1;
+    }
+    int rc = pthread_mutex_lock(&pool->mutex);
+    if (rc != 0) { errno = rc; return -1; }
+    int worker_error = atomic_load_explicit(&pool->worker_error, memory_order_acquire);
+    if (pool->stopping || worker_error) {
+        int error = worker_error ? worker_error : ESHUTDOWN;
+        (void)pthread_mutex_unlock(&pool->mutex);
+        errno = error;
+        return -1;
+    }
+    job->sequence = pool->next_sequence++;
+    job->next = NULL;
+    if (pool->work_tail) pool->work_tail->next = job;
+    else pool->work_head = job;
+    pool->work_tail = job;
+    ++pool->outstanding;
+    rc = pthread_cond_signal(&pool->work_ready);
+    (void)pthread_mutex_unlock(&pool->mutex);
+    if (rc != 0) {
+        atomic_store_explicit(&pool->worker_error, rc, memory_order_release);
+        notify_hash_completion(pool);
+    }
+    return 0;
+}
+
+static int hash_pool_drain(struct hash_pool *pool, int logfd,
+                           const struct watch_context *ctx) {
+    if (pool->consumer_error) { errno = EIO; return -1; }
+    while (pool->outstanding > 0U) {
+        size_t reaped = 0U;
+        if (hash_pool_reap_ready(pool, ctx->next_commit_sequence, logfd, ctx, &reaped) != 0)
+            return -1;
+        if (pool->outstanding > 0U && reaped == 0U &&
+            hash_pool_wait_for_completion(pool) != 0) return -1;
+    }
+    return 0;
+}
+
 static uint64_t clock_ns(clockid_t clock_id) {
     struct timespec now;
     if (clock_gettime(clock_id, &now) != 0 || now.tv_sec < 0) return 0U;
@@ -807,56 +1121,21 @@ static int flush_pending_event(struct event_batch *batch, size_t index, int logf
         errno = EPERM; return -1;
     }
     const char *relative = event.path + root_len + 1U;
-    int found = 0;
-    size_t old_index = row_index(ctx->snapshot, relative, &found);
-    char before_hash[65];
-    const char *before_sha256 = NULL;
-    if (found) {
-        memcpy(before_hash, ctx->snapshot->v[old_index].hash, sizeof(before_hash));
-        before_sha256 = before_hash;
+    if (!valid_relative_path(relative)) { errno = EINVAL; return -1; }
+    struct hash_job *job = calloc(1U, sizeof(*job));
+    if (!job) return -1;
+    job->event = event;
+    int n = snprintf(job->relative, sizeof(job->relative), "%s", relative);
+    if (n < 0 || (size_t)n >= sizeof(job->relative)) {
+        free_hash_job(job); errno = ENAMETOOLONG; return -1;
     }
-    struct file_row current = {0};
-    int scan_rc = -1;
-    int scan_error = EIO;
-    for (unsigned int attempt = 0U; attempt < 3U; ++attempt) {
-        errno = 0;
-        scan_rc = scan_relative_file(ctx->rootfd, ctx->root_dev, relative, &current);
-        scan_error = errno ? errno : EIO;
-        if (scan_rc >= 0 || scan_error != EAGAIN) break;
-        const struct timespec retry_delay = { .tv_sec = 0, .tv_nsec = 10000000L };
-        (void)nanosleep(&retry_delay, NULL);
+    n = snprintf(job->coverage, sizeof(job->coverage), "%s", coverage);
+    if (n < 0 || (size_t)n >= sizeof(job->coverage)) {
+        free_hash_job(job); errno = EOVERFLOW; return -1;
     }
-    if (scan_rc < 0) {
-        int saved_error = scan_error;
-        const char *reason = saved_error == EAGAIN ? "unstable_file_retry_exhausted" : "file_hash_failed";
-        if (emit_event_full(logfd, "file.unknown", event.path, "degraded", event.mask, 0U,
-                            reason, 0, event.count, event.first_realtime_ns,
-                            event.last_realtime_ns, before_sha256, NULL, saved_error) != 0) return -1;
-        remove_pending_event(batch, index);
-        return 0;
+    if (hash_pool_submit(ctx->hash_pool, job, logfd, ctx) != 0) {
+        free_hash_job(job); return -1;
     }
-
-    const char *kind = NULL;
-    const char *after_sha256 = scan_rc == 0 ? current.hash : NULL;
-    if (scan_rc == 1) {
-        if (found) { rows_remove(ctx->snapshot, old_index); kind = "file.deleted"; }
-        else kind = "file.unchanged";
-    } else if (!found) {
-        kind = "file.created";
-        if (rows_upsert(ctx->snapshot, &current) != 0) { free(current.path); return -1; }
-    } else {
-        const struct file_row *old = &ctx->snapshot->v[old_index];
-        if (strcmp(old->hash, current.hash) != 0 || old->size != current.size)
-            kind = "file.modified";
-        else if (rows_differ(old, &current))
-            kind = "file.metadata_changed";
-        else
-            kind = "file.unchanged";
-        if (rows_upsert(ctx->snapshot, &current) != 0) { free(current.path); return -1; }
-    }
-    if (emit_event_full(logfd, kind, event.path, coverage, event.mask, 0U, NULL, 0,
-                        event.count, event.first_realtime_ns, event.last_realtime_ns,
-                        before_sha256, after_sha256, 0) != 0) return -1;
     remove_pending_event(batch, index);
     return 0;
 }
@@ -1001,7 +1280,8 @@ static int rebuild_and_reconcile(int *inofd, struct watches *ws, const char *roo
     if (strcmp(reason, "watch_startup") != 0 &&
         emit_coverage_event(logfd, root, "degraded", reason, 0U) != 0) return -2;
     if (emit_coverage_event(logfd, root, "recovering", reason, 0U) != 0) return -2;
-    if (flush_pending_events(batch, logfd, "recovering", ctx) != 0) return -2;
+    if (flush_pending_events(batch, logfd, "recovering", ctx) != 0 ||
+        hash_pool_drain(ctx->hash_pool, logfd, ctx) != 0) return -2;
     if (*inofd >= 0) close(*inofd);
     *inofd = -1;
     free_watches(ws);
@@ -1053,7 +1333,8 @@ static int verify_current_snapshot(const char *root, struct rows *snapshot,
                                    int *coverage_healthy, const struct watch_context *ctx,
                                    const char *reason, const char *success_reason) {
     if (emit_coverage_event(logfd, root, "recovering", reason, 0U) != 0) return -1;
-    if (flush_pending_events(batch, logfd, *coverage_healthy ? "healthy" : "degraded", ctx) != 0)
+    if (flush_pending_events(batch, logfd, *coverage_healthy ? "healthy" : "degraded", ctx) != 0 ||
+        hash_pool_drain(ctx->hash_pool, logfd, ctx) != 0)
         return -1;
     struct rows current = {0};
     errno = EIO;
@@ -1110,16 +1391,26 @@ static int cmd_watch(const char *root_arg, const char *events, const char *pidfi
     if (pfd < 0) { free(batch.rows); close(rootfd); close(logfd); free_rows(&snapshot); return fail("pidfile exists or inaccessible"); }
     dprintf(pfd, "%ld\n", (long)getpid()); close(pfd);
     signal(SIGINT, on_signal); signal(SIGTERM, on_signal);
+    struct hash_pool hash_pool;
+    if (hash_pool_start(&hash_pool, rootfd, rootst.st_dev) != 0) {
+        int saved_error = errno;
+        unlink(pidfile); free(batch.rows); close(rootfd); close(logfd); free_rows(&snapshot);
+        errno = saved_error; return fail("start hash worker pool");
+    }
+    int exit_status = 0;
+    uint64_t next_commit_sequence = 1U;
     struct watch_context ctx = { .root = root, .rootfd = rootfd,
-                                 .root_dev = rootst.st_dev, .snapshot = &snapshot };
+                                 .root_dev = rootst.st_dev, .snapshot = &snapshot,
+                                 .hash_pool = &hash_pool,
+                                 .next_commit_sequence = &next_commit_sequence };
     int coverage_healthy = 0;
     int recovery_rc = rebuild_and_reconcile(&inofd, &ws, root, rootst.st_dev,
                                             &snapshot, &have_snapshot, &batch, logfd,
                                             &ctx, "watch_startup");
-    if (recovery_rc == -2) stopping = 1;
+    if (recovery_rc == -2) { exit_status = 1; stopping = 1; }
     coverage_healthy = recovery_rc == 0;
     uint64_t last_verify_ns = clock_ns(CLOCK_MONOTONIC);
-    if (!last_verify_ns) stopping = 1;
+    if (!last_verify_ns) { exit_status = 1; stopping = 1; }
     const uint64_t verify_interval_ns = (uint64_t)verify_interval_seconds * 1000000000ULL;
     unsigned int degraded_idle = 0;
     int injected = 0;
@@ -1127,10 +1418,13 @@ static int cmd_watch(const char *root_arg, const char *events, const char *pidfi
     unsigned char buf[EVENT_BUFFER];
     puts("watching; coverage is recorded in the event journal; Ctrl-C or fimctl stop will stop the monitor");
     while (!stopping) {
-        struct pollfd p = { .fd = inofd, .events = POLLIN };
+        struct pollfd p[2] = {
+            { .fd = inofd, .events = POLLIN },
+            { .fd = hash_pool.completion_fd, .events = POLLIN }
+        };
         int had_pending_events = batch.n != 0U;
-        int ready = poll(&p, 1, pending_poll_timeout(&batch, 1000));
-        if (ready < 0 && errno == EINTR) continue;
+        int ready = poll(p, 2, pending_poll_timeout(&batch, 1000));
+        if (ready < 0 && errno == EINTR) { if (stopping) break; else continue; }
         int need_reconcile = 0;
         const char *reconcile_reason = NULL;
         int need_snapshot_verify = 0;
@@ -1139,11 +1433,27 @@ static int cmd_watch(const char *root_arg, const char *events, const char *pidfi
             need_reconcile = 1;
             reconcile_reason = "poll_failed";
         }
+        if (ready > 0 && (p[1].revents & (POLLERR | POLLHUP | POLLNVAL))) {
+            errno = EIO; exit_status = 1; stopping = 1; break;
+        }
+        if (ready > 0 && (p[0].revents & (POLLERR | POLLHUP | POLLNVAL))) {
+            need_reconcile = 1;
+            reconcile_reason = "poll_failed";
+        }
+        if (ready > 0 && (p[1].revents & POLLIN)) {
+            if (hash_pool_consume_notification(&hash_pool) != 0) {
+                exit_status = 1; stopping = 1; break;
+            }
+        }
+        size_t reaped = 0U;
+        if (hash_pool_reap_ready(&hash_pool, &next_commit_sequence, logfd, &ctx, &reaped) != 0) {
+            exit_status = 1; stopping = 1; break;
+        }
         if (ready == 0) {
             const char *coverage = coverage_healthy ? "healthy" : "degraded";
             if (flush_expired_events(&batch, logfd, coverage, &ctx) != 0 ||
                 expire_renames(&renames, logfd, coverage) != 0) {
-                stopping = 1; break;
+                exit_status = 1; stopping = 1; break;
             }
             if (inject_overflow_once && inject_ready && !injected && !had_pending_events) {
                 need_reconcile = 1;
@@ -1156,7 +1466,7 @@ static int cmd_watch(const char *root_arg, const char *events, const char *pidfi
             }
         }
         ssize_t n = 0;
-        if (ready > 0) {
+        if (ready > 0 && (p[0].revents & POLLIN)) {
             n = inofd >= 0 ? read(inofd, buf, sizeof(buf)) : -1;
             if (n < 0 && (errno == EAGAIN || errno == EINTR)) continue;
             if (n < 0) {
@@ -1199,14 +1509,14 @@ static int cmd_watch(const char *root_arg, const char *events, const char *pidfi
                                                     ev->mask, ev->cookie) != 0) ||
                         (!direct_event && pending_event_add(&batch, full, ev->mask,
                                                            logfd, coverage, &ctx) != 0)) {
-                        stopping = 1; break;
+                        exit_status = 1; stopping = 1; break;
                     }
                     inject_ready = 1;
                     if (ev->mask & IN_MOVED_FROM) {
                         if (remember_rename(&renames, ev->cookie, full) != 0) {
                             if (emit_event(logfd, "file.rename_match_failed", full, "degraded",
                                            ev->mask, ev->cookie) != 0) {
-                                stopping = 1; break;
+                                exit_status = 1; stopping = 1; break;
                             }
                             need_reconcile = 1;
                             reconcile_reason = "rename_correlation_capacity";
@@ -1216,11 +1526,11 @@ static int cmd_watch(const char *root_arg, const char *events, const char *pidfi
                             if (emit_event(logfd, "path.renamed", full,
                                            coverage_healthy ? "healthy" : "degraded",
                                            ev->mask, ev->cookie) != 0) {
-                                stopping = 1; break;
+                                exit_status = 1; stopping = 1; break;
                             }
                         } else if (emit_event(logfd, "file.rename_match_failed", full,
                                               "degraded", ev->mask, ev->cookie) != 0) {
-                            stopping = 1; break;
+                            exit_status = 1; stopping = 1; break;
                         }
                     }
                     if ((ev->mask & (IN_MOVED_FROM | IN_MOVED_TO)) && (ev->mask & IN_ISDIR) == 0U) {
@@ -1244,44 +1554,51 @@ static int cmd_watch(const char *root_arg, const char *events, const char *pidfi
                                   coverage_healthy ? "healthy" : "degraded", &ctx) != 0 ||
              expire_renames(&renames, logfd,
                             coverage_healthy ? "healthy" : "degraded") != 0)) {
-            stopping = 1; break;
+            exit_status = 1; stopping = 1; break;
         }
         if (!stopping && need_reconcile) {
             recovery_rc = rebuild_and_reconcile(&inofd, &ws, root, rootst.st_dev,
                                                 &snapshot, &have_snapshot, &batch, logfd,
                                                 &ctx,
                                                 reconcile_reason ? reconcile_reason : "unknown_failure");
-            if (recovery_rc == -2) stopping = 1;
+            if (recovery_rc == -2) { exit_status = 1; stopping = 1; }
             coverage_healthy = recovery_rc == 0;
             degraded_idle = 0;
             last_verify_ns = clock_ns(CLOCK_MONOTONIC);
         } else if (!stopping && need_snapshot_verify) {
             if (verify_current_snapshot(root, &snapshot, &have_snapshot,
                                         &batch, logfd, &coverage_healthy, &ctx,
-                                        snapshot_verify_reason, "snapshot_refresh_complete") != 0)
-                stopping = 1;
+                                        snapshot_verify_reason, "snapshot_refresh_complete") != 0) {
+                exit_status = 1; stopping = 1;
+            }
             last_verify_ns = clock_ns(CLOCK_MONOTONIC);
         } else if (!stopping) {
             uint64_t now = clock_ns(CLOCK_MONOTONIC);
             if (!now) {
-                stopping = 1;
+                exit_status = 1; stopping = 1;
             } else if (now >= last_verify_ns && now - last_verify_ns >= verify_interval_ns) {
                 if (verify_current_snapshot(root, &snapshot, &have_snapshot,
                                             &batch, logfd, &coverage_healthy, &ctx,
                                             "periodic_verification",
-                                            "periodic_verification_complete") != 0)
-                    stopping = 1;
+                                            "periodic_verification_complete") != 0) {
+                    exit_status = 1; stopping = 1;
+                }
                 last_verify_ns = clock_ns(CLOCK_MONOTONIC);
             }
         }
     }
-    (void)flush_pending_events(&batch, logfd, coverage_healthy ? "healthy" : "degraded", &ctx);
+    if (flush_pending_events(&batch, logfd, coverage_healthy ? "healthy" : "degraded", &ctx) != 0 ||
+        hash_pool_drain(&hash_pool, logfd, &ctx) != 0) {
+        fprintf(stderr, "fimctl: could not flush pending hash work: %s\n", strerror(errno));
+        exit_status = 1;
+    }
+    hash_pool_stop(&hash_pool);
     unlink(pidfile);
     free(batch.rows); free_watches(&ws); free_rows(&snapshot);
     close(logfd);
     close(rootfd);
     if (inofd >= 0) close(inofd);
-    return 0;
+    return exit_status;
 }
 
 static int cmd_stop(const char *pidfile) {
