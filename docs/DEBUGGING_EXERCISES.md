@@ -2,39 +2,39 @@
 
 These exercises are intentionally unsolved. Attempt one before asking for a walkthrough. No complete solution or patch is included here. Use a disposable directory under `/tmp`; do not point experiments at personal or system data.
 
-## Exercise 1 — New nested directory coverage
+## Exercise 1 — Watch resource failure and retry
 
-**Goal:** Reproduce and diagnose the race/coverage behavior when a directory is created and files are written immediately beneath it.
+**Goal:** Verify that partial recursive watch registration remains visibly degraded and can recover after the resource constraint is removed.
 
-**Starting points:** `cmd_watch`, the `IN_CREATE | IN_ISDIR` branch, `add_tree_watches`, and `tests/smoke.sh`.
-
-**Tasks:**
-
-1. Add a deterministic fixture that creates a nested directory and writes a child immediately.
-2. Record which inotify events are emitted and whether a second-level child is observed.
-3. Make watch-registration failure visible as degraded coverage without claiming the event stream is complete.
-4. Add a regression assertion for the chosen behavior.
-
-**Constraints:** Keep the watcher read-only. Do not follow symlinks or cross the root device. Do not silently convert a watch error into a healthy event.
-
-**Acceptance:** The test is repeatable, and its output distinguishes a failed watch from a quiet directory.
-
-## Exercise 2 — Coalesce event bursts while preserving evidence
-
-**Goal:** Reduce redundant downstream work during rapid writes without losing the evidence needed to explain the observed burst.
-
-**Starting points:** `cmd_watch`, `emit_event`, the `coverage` object in event.v1, and the `IN_CLOSE_WRITE`/`IN_ATTRIB` masks in `inotify(7)`.
+**Starting points:** `watch_add`, `add_tree_watches`, `rebuild_and_reconcile`, and `tests/smoke.sh`.
 
 **Tasks:**
 
-1. Generate a burst of write and metadata events for one fixture file.
-2. Define a bounded coalescing window and an output record that preserves first/last observation times and raw event count.
-3. Add a deterministic test for a burst, a quiet period, and queue pressure.
-4. Decide how to flush pending records during shutdown and how to report dropped/coalesced counts.
+1. Add a test-only, bounded way to force a recursive watch-registration failure without changing host sysctls.
+2. Assert that the journal records `coverage.degraded` and does not claim healthy coverage while a directory is unwatched.
+3. Remove the injected constraint and demonstrate that a later retry rebuilds the watch tree and returns to healthy coverage.
+4. Verify that a child file created during the degraded interval appears in the reconciliation report when observable.
 
-**Constraints:** Bound memory and event delay. Do not hash or modify monitored files. Keep actor attribution unknown and make dropped evidence visible.
+**Constraints:** Keep the watcher read-only. Do not follow symlinks or cross the root device. Do not lower or modify host-wide inotify limits. Do not silently convert a watch error into a healthy event.
 
-**Acceptance:** Tests show a bounded summary of the burst, retain its time/count range, and distinguish coalescing from lost events.
+**Acceptance:** The test is repeatable, bounded, and distinguishes persistent watch failure from a quiet directory and successful recovery.
+
+## Exercise 2 — Coalescer capacity and no-drop behavior
+
+**Goal:** Verify bounded coalescer behavior when more distinct paths become pending than the table can hold.
+
+**Starting points:** `pending_event_add`, `flush_pending_event`, `pending_poll_timeout`, and `tests/smoke.sh`.
+
+**Tasks:**
+
+1. Generate distinct file events for more than 256 paths before their quiet windows expire.
+2. Verify that the oldest record flushes early, every observed path still appears, and its mask/count/time-range evidence remains valid.
+3. Add a deterministic assertion that the table stays within its bound and no record is silently dropped.
+4. Consider whether an explicit coalesced/early-flush marker would help operators distinguish capacity pressure from an ordinary quiet-window flush.
+
+**Constraints:** Keep memory bounded. Do not fill the host filesystem or hash/modify unrelated files. Keep actor attribution unknown and make any loss visible.
+
+**Acceptance:** Tests prove the 257th distinct pending path does not silently discard an earlier observation and that all evidence fields remain internally consistent.
 
 ## Exercise 3 — Stable file hashing under concurrent mutation
 

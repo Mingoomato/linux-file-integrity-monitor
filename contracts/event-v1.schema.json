@@ -14,7 +14,17 @@
     "severity": {"enum": ["info", "low", "medium", "high"]},
     "target": {"type": "object", "required": ["path"], "properties": {"path": {"type": "string", "maxLength": 4096}}},
     "actor": {"type": "object", "required": ["pid", "attribution"], "properties": {"pid": {"type": ["integer", "null"]}, "start_time_ticks": {"type": ["integer", "null"]}, "attribution": {"const": "unknown"}}},
-    "evidence": {"type": "object"},
+    "evidence": {
+      "type": "object",
+      "properties": {
+        "event_mask": {"type": "integer", "minimum": 0},
+        "rename_cookie": {"type": "integer", "minimum": 0},
+        "reconciliation": {"type": "boolean"},
+        "observation_count": {"type": "integer", "minimum": 0},
+        "first_observed_unix_ns": {"type": ["integer", "null"], "minimum": 0},
+        "last_observed_unix_ns": {"type": ["integer", "null"], "minimum": 0}
+      }
+    },
     "coverage": {"type": "object", "required": ["state"], "properties": {"state": {"enum": ["healthy", "degraded", "unsupported", "recovering"]}, "reason": {"type": ["string", "null"]}}}
   },
   "additionalProperties": false

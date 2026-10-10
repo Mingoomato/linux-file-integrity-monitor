@@ -21,15 +21,15 @@ C17 컴파일러, CMake, OpenSSL libcrypto, SQLite 개발 헤더가 필요합니
 
 ### 검증 및 한계
 
-현재 Linux 호스트에서 Release 빌드, CTest 스모크 1/1, 별도 ASan/UBSan 스모크가 통과했습니다. 스모크는 기준선 생성/비교, JSON 경로 내보내기, 심볼릭 링크 제외, 재귀 inotify 이벤트, 쿠키 기반 rename 짝짓기, 짝 없는 이동 진입과 이동 타임아웃 기록, PID 파일을 이용한 종료를 확인합니다. 큐 오버플로 재조정, mount 경계, 동시 파일 변경, 디스크 오류, 10,000개 파일 성능, Ubuntu/Rocky 런타임 매트릭스는 확인하지 않았습니다.
+현재 Linux 호스트에서 GCC Release, Clang Release, ASan/UBSan CTest가 각각 1/1 통과했고 Clang 정적 분석도 경고 없이 끝났습니다. 스모크는 기준선 생성/비교, JSON 경로 내보내기, 심볼릭 링크 제외, 이벤트 burst coalescing과 원본 신호 수·시각 범위, rename 짝짓기·타임아웃, 신규 디렉터리 생성·이동 후 재감시, 큐 오버플로 주입 뒤 전체 재검사와 생성/삭제/메타데이터 차이 보고, PID 파일 종료를 확인합니다. 실제 커널 큐 오버플로, watch 자원 고갈, mount 경계, 동시 파일 변경, 디스크 오류, 10,000개 파일 성능, Ubuntu/Rocky 런타임 매트릭스는 확인하지 않았습니다.
 
-스캔은 심볼릭 링크를 따라가지 않고 선택한 루트와 다른 장치의 파일을 제외합니다. 감시기는 제한된 256개 항목의 pending rename 표로 inotify 쿠키를 짝짓고, 짝 없는 진입과 시간 초과를 별도 기록합니다. 이벤트는 유실되거나 합쳐질 수 있고 프로세스 행위자를 알 수 없습니다. 현재 감시는 기준선을 자동으로 재조정하지 않으며, 오버플로 이후 자동 전체 재검사를 보장하지 않습니다. 데이터베이스와 로그는 같은 사용자 또는 root에 의한 변조를 막지 못합니다. 민감한 경로가 로그에 기록될 수 있으니 개인 파일 대신 폐기 가능한 실습 경로를 사용하세요.
+스캔은 심볼릭 링크를 따라가지 않고 선택한 루트와 다른 장치의 파일을 제외합니다. 감시기는 256개 항목의 pending rename/coalescing 표와 100ms quiet window를 사용해 신호 burst를 묶고, `observation_count` 및 최초·마지막 관찰 시각을 기록합니다. rename 신호는 쿠키 짝짓기를 위해 즉시 별도 기록합니다. 큐 오버플로, 감시 무효화, 디렉터리 추가·이동 때 `recovering` 상태를 기록하고 감시 트리와 파일 상태를 다시 검사합니다. 전체 watch 등록과 스캔이 성공하면 `healthy`, 실패하면 `degraded`를 기록하며, 재검사 차이는 별도 reconciliation 증거로 남깁니다. `--inject-overflow-once`는 이 경로의 합성 회귀 테스트 전용이며 실제 커널 큐 오버플로 시험은 아닙니다. inotify 이벤트는 유실되거나 합쳐질 수 있고 프로세스 행위자를 알 수 없습니다. 기준선 비교를 위한 hash debounce와 주기적 전체 검사는 아직 없습니다. 데이터베이스와 로그는 같은 사용자 또는 root에 의한 변조를 막지 못합니다. 민감한 경로가 로그에 기록될 수 있으니 개인 파일 대신 폐기 가능한 실습 경로를 사용하세요.
 
 상세 설계와 한계는 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md), [`docs/TEST_RESULTS.md`](docs/TEST_RESULTS.md)를 참고하세요.
 
 ## English
 
-`fimctl` stores a SHA-256 baseline for ordinary files beneath an explicitly selected lab directory and compares later scans with that baseline. Its `watch` command emits local NDJSON notifications from inotify. It is an educational, read-only observer, not a prevention or recovery product.
+`fimctl` is an educational, read-only file integrity monitor. It records a SHA-256 and metadata baseline for ordinary files beneath an explicitly selected lab directory, compares later scans, and writes local NDJSON observations from inotify. The project demonstrates descriptor-relative traversal, stable-file hashing, transactional SQLite storage, event-loss handling, and the limits of a best-effort Linux notification stream. It does not prevent changes, identify the process that made them, or recover files.
 
 ## Build
 
@@ -49,13 +49,13 @@ mkdir -p "$HOME/fim-lab"
 ./build/fimctl watch --root "$HOME/fim-lab" --events ./events.ndjson
 ```
 
-`init` refuses to replace an existing database. `scan` deliberately replaces the current baseline. `verify` returns 2 when it finds differences. Run `watch` in a separate terminal and stop it with Ctrl-C or `fimctl stop --pidfile ./fimd.pid`.
+`init` refuses to replace an existing database. `scan` deliberately replaces the current baseline. `verify` returns 2 when it finds differences. Run `watch` in a separate terminal and stop it with Ctrl-C or `fimctl stop --pidfile ./fimd.pid`. `watch` coalesces non-rename signals for the same path over a bounded 100 ms quiet window and records signal count plus first/last observation timestamps. The explicit lab-only `--inject-overflow-once` option exercises reconciliation in tests; omit it during normal observation.
 
 ## Scope and limitations
 
-Traversal refuses symlinks and skips filesystems mounted below the selected root during baseline scanning. A bounded 256-entry pending-move table correlates inotify cookies; unmatched move-in and timed-out move-out events are kept distinct. Inotify does not identify the process that changed a file, can coalesce events, and can overflow. The live watcher is a notification stream; it does not yet reconcile automatically or update the baseline. A degraded event directs the operator to run `verify --full`. Export paths are local data and may contain personal information.
+Traversal refuses symlinks and skips filesystems mounted below the selected root during baseline scanning. A bounded table correlates rename cookies and coalesces other signals for each path over a 100 ms quiet window; the journal retains the combined mask, signal count, and first/last wall-clock nanoseconds. On queue overflow, invalidated watches, or directory-tree changes, the watcher records `recovering`, rebuilds recursive watches, scans current file state, emits reconciliation differences, and records `healthy` only when both operations succeed. The smoke test injects an overflow condition through a clearly named option; it does not force the kernel queue itself to overflow. Inotify does not identify the process that changed a file and can coalesce events in the kernel. Baseline-aware hash debounce, periodic verification, watch-limit fault injection, mount-boundary and concurrent-mutation tests, a 10k-file benchmark, and the Ubuntu/Rocky runtime matrix remain open. Export paths are local data and may contain personal information.
 
-Supported target is a Linux filesystem and an unprivileged lab directory. No Ubuntu/Rocky runtime matrix has been executed. Run `ctest --test-dir build --output-on-failure`; the smoke test covers baseline creation/comparison, JSON path escaping, symlink exclusion, paired and unmatched rename observations, move timeout, inotify event output, and monitor shutdown. It does not simulate queue overflow/reconciliation, mount boundaries, concurrent mutation, or filesystem errors; see `docs/TEST_RESULTS.md`.
+Supported target is a Linux filesystem and an unprivileged lab directory. No Ubuntu/Rocky runtime matrix has been executed. Run `ctest --test-dir build --output-on-failure`; the smoke test covers baseline creation/comparison, JSON path escaping, symlink exclusion, coalesced event bursts, paired and unmatched rename observations, move timeout, recursive watch recovery, synthetic overflow reconciliation, and monitor shutdown. See `docs/TEST_RESULTS.md` for the evidence and remaining gates.
 
 ## Safety
 

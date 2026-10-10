@@ -25,6 +25,8 @@
 #define MAX_DEPTH 128
 #define EVENT_BUFFER 65536
 #define MAX_PENDING_RENAMES 256U
+#define MAX_PENDING_EVENTS 256U
+#define EVENT_DEBOUNCE_MS 100U
 #define RENAME_TIMEOUT_SECONDS 2
 
 struct file_row {
@@ -46,6 +48,17 @@ struct pending_renames {
     struct pending_rename rows[MAX_PENDING_RENAMES];
     size_t n;
 };
+struct pending_file_event {
+    char path[PATH_MAX];
+    uint32_t mask, last_action_mask, count;
+    uint64_t first_monotonic_ns, last_monotonic_ns;
+    uint64_t first_realtime_ns, last_realtime_ns;
+};
+struct event_batch {
+    struct pending_file_event *rows;
+    size_t n;
+    unsigned int window_ms;
+};
 
 static volatile sig_atomic_t stopping;
 
@@ -53,6 +66,8 @@ static void on_signal(int sig) { (void)sig; stopping = 1; }
 
 static int emit_event(int fd, const char *kind, const char *path, const char *coverage,
                       uint32_t mask, uint32_t cookie);
+static int emit_coverage_event(int fd, const char *path, const char *state,
+                               const char *reason, uint32_t mask);
 
 static int fail(const char *message) {
     fprintf(stderr, "fimctl: %s: %s\n", message, strerror(errno));
@@ -185,7 +200,9 @@ static int scan_dir(int dirfd, const char *relative, dev_t root_dev,
         errno = 0;
     }
     if (!result && errno != 0) result = -1;
+    int saved_error = errno;
     closedir(dir);
+    if (result != 0) errno = saved_error ? saved_error : EIO;
     return result;
 }
 
@@ -200,8 +217,10 @@ static int scan_root(const char *root, struct rows *rows) {
     struct stat st;
     int rc = fstat(fd, &st);
     if (rc == 0) rc = scan_dir(fd, "", st.st_dev, rows, 0);
+    int saved_error = rc == 0 ? 0 : errno;
     close(fd);
-    if (rc == 0) {
+    if (rc != 0) errno = saved_error ? saved_error : EIO;
+    if (rc == 0 && rows->n > 1U) {
         qsort(rows->v, rows->n, sizeof(*rows->v), row_path_compare);
     }
     return rc;
@@ -285,7 +304,13 @@ static int get_root(sqlite3 *db, char root[PATH_MAX]) {
     int rc = sqlite3_step(stmt);
     if (rc == SQLITE_ROW) {
         const unsigned char *s = sqlite3_column_text(stmt, 0);
-        if (s) (void)snprintf(root, PATH_MAX, "%s", (const char *)s);
+        int length = sqlite3_column_bytes(stmt, 0);
+        if (!s || length <= 0 || length >= PATH_MAX) {
+            rc = SQLITE_ERROR;
+        } else {
+            memcpy(root, s, (size_t)length);
+            root[length] = '\0';
+        }
     }
     sqlite3_finalize(stmt);
     return rc == SQLITE_ROW ? 0 : -1;
@@ -319,6 +344,8 @@ static int compare_rows(sqlite3 *db, const struct rows *rows, int json) {
         }
         const struct file_row *cur = &rows->v[i++];
         const char *hash = (const char *)sqlite3_column_text(stmt, 8);
+        uint64_t device = (uint64_t)sqlite3_column_int64(stmt, 1);
+        uint64_t inode = (uint64_t)sqlite3_column_int64(stmt, 2);
         uint64_t size = (uint64_t)sqlite3_column_int64(stmt, 6);
         uint64_t mtime = (uint64_t)sqlite3_column_int64(stmt, 7);
         uint32_t mode = (uint32_t)sqlite3_column_int64(stmt, 3);
@@ -326,7 +353,8 @@ static int compare_rows(sqlite3 *db, const struct rows *rows, int json) {
             if (json) print_json_path("modified", cur->path);
             else printf("modified %s\n", cur->path);
             ++changed;
-        } else if (cur->mtime_ns != mtime || cur->mode != mode ||
+        } else if (cur->dev != device || cur->ino != inode ||
+                   cur->mtime_ns != mtime || cur->mode != mode ||
                    cur->uid != (uint32_t)sqlite3_column_int64(stmt, 4) ||
                    cur->gid != (uint32_t)sqlite3_column_int64(stmt, 5)) {
             if (json) print_json_path("metadata_changed", cur->path);
@@ -348,6 +376,7 @@ static int compare_rows(sqlite3 *db, const struct rows *rows, int json) {
 static void json_escape(const char *in, char *out, size_t cap) {
     size_t n = 0;
     static const char hex[] = "0123456789abcdef";
+    if (!in) { if (cap) out[0] = '\0'; return; }
     for (const unsigned char *p = (const unsigned char *)in; *p && n + 1U < cap; ++p) {
         if (*p == '"' || *p == '\\') {
             if (n + 2U >= cap) break;
@@ -364,6 +393,7 @@ static void json_escape(const char *in, char *out, size_t cap) {
 static int watch_add(struct watches *ws, int inofd, const char *path) {
     int wd = inotify_add_watch(inofd, path, IN_CREATE | IN_DELETE | IN_CLOSE_WRITE |
                                IN_ATTRIB | IN_MOVED_FROM | IN_MOVED_TO | IN_IGNORED |
+                               IN_DELETE_SELF | IN_MOVE_SELF | IN_UNMOUNT |
                                IN_ONLYDIR | IN_DONT_FOLLOW);
     if (wd < 0) return -1;
     for (size_t i = 0; i < ws->n; ++i) if (ws->v[i].wd == wd) return 0;
@@ -408,7 +438,7 @@ static int take_rename(struct pending_renames *pending, uint32_t cookie) {
     return 0;
 }
 
-static int expire_renames(struct pending_renames *pending, int logfd) {
+static int expire_renames(struct pending_renames *pending, int logfd, const char *coverage) {
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return -1;
     for (size_t i = 0; i < pending->n;) {
@@ -416,7 +446,7 @@ static int expire_renames(struct pending_renames *pending, int logfd) {
         if (now.tv_nsec < pending->rows[i].observed.tv_nsec) --age;
         if (age < RENAME_TIMEOUT_SECONDS) { ++i; continue; }
         if (emit_event(logfd, "file.rename_timeout", pending->rows[i].path,
-                       "healthy", IN_MOVED_FROM, pending->rows[i].cookie) != 0) return -1;
+                       coverage, IN_MOVED_FROM, pending->rows[i].cookie) != 0) return -1;
         if (i + 1U < pending->n)
             memmove(&pending->rows[i], &pending->rows[i + 1U],
                     (pending->n - i - 1U) * sizeof(pending->rows[0]));
@@ -442,18 +472,33 @@ static int add_tree_watches(int inofd, struct watches *ws, const char *path,
         int n = snprintf(child, sizeof(child), "%s/%s", path, e->d_name);
         if (n < 0 || (size_t)n >= sizeof(child)) { rc = -1; errno = ENAMETOOLONG; break; }
         struct stat st;
-        if (lstat(child, &st) == 0 && S_ISDIR(st.st_mode) && !S_ISLNK(st.st_mode) &&
-            st.st_dev == root_dev) {
-            if (add_tree_watches(inofd, ws, child, root_dev, depth + 1U) != 0) { rc = -1; break; }
+        if (lstat(child, &st) == 0) {
+            if (S_ISDIR(st.st_mode) && !S_ISLNK(st.st_mode) && st.st_dev == root_dev &&
+                add_tree_watches(inofd, ws, child, root_dev, depth + 1U) != 0) {
+                rc = -1; break;
+            }
+        } else if (errno != ENOENT) {
+            rc = -1; break;
         }
     }
+    int saved_error = rc == 0 ? 0 : errno;
     closedir(dir);
+    if (rc != 0) errno = saved_error ? saved_error : EIO;
     return rc;
 }
 
-static int emit_event(int fd, const char *kind, const char *path, const char *coverage,
-                      uint32_t mask, uint32_t cookie) {
+static int emit_event_full(int fd, const char *kind, const char *path, const char *coverage,
+                           uint32_t mask, uint32_t cookie, const char *reason,
+                           int reconciliation, uint32_t observation_count,
+                           uint64_t first_observed_ns, uint64_t last_observed_ns) {
     char escaped[PATH_MAX * 6U + 1U]; json_escape(path ? path : "", escaped, sizeof(escaped));
+    char escaped_reason[256], reason_json[260];
+    if (reason) {
+        json_escape(reason, escaped_reason, sizeof(escaped_reason));
+        (void)snprintf(reason_json, sizeof(reason_json), "\"%s\"", escaped_reason);
+    } else {
+        (void)snprintf(reason_json, sizeof(reason_json), "null");
+    }
     unsigned char random_id[16];
     if (RAND_bytes(random_id, sizeof(random_id)) != 1) { errno = EIO; return -1; }
     random_id[6] = (unsigned char)((random_id[6] & 0x0fU) | 0x40U);
@@ -471,15 +516,25 @@ static int emit_event(int fd, const char *kind, const char *path, const char *co
         errno = EIO; return -1;
     }
     char line[EVENT_MAX_BYTES];
+    char first_observed_json[32], last_observed_json[32];
+    if (first_observed_ns) (void)snprintf(first_observed_json, sizeof(first_observed_json),
+                                          "%llu", (unsigned long long)first_observed_ns);
+    else (void)snprintf(first_observed_json, sizeof(first_observed_json), "null");
+    if (last_observed_ns) (void)snprintf(last_observed_json, sizeof(last_observed_json),
+                                         "%llu", (unsigned long long)last_observed_ns);
+    else (void)snprintf(last_observed_json, sizeof(last_observed_json), "null");
     int n = snprintf(line, sizeof(line),
         "{\"schema_version\":\"event.v1\",\"event_id\":\"%s\","
         "\"source\":\"fim\",\"host_id\":\"local\",\"observed_at\":\"%s\","
         "\"kind\":\"%s\",\"severity\":\"info\",\"target\":{\"path\":\"%s\"},"
         "\"actor\":{\"pid\":null,\"start_time_ticks\":null,\"attribution\":\"unknown\"},"
-        "\"evidence\":{\"event_mask\":%u,\"rename_cookie\":%u},"
-        "\"coverage\":{\"state\":\"%s\",\"reason\":null}}\n",
+        "\"evidence\":{\"event_mask\":%u,\"rename_cookie\":%u,"
+        "\"reconciliation\":%s,\"observation_count\":%u,"
+        "\"first_observed_unix_ns\":%s,\"last_observed_unix_ns\":%s},"
+        "\"coverage\":{\"state\":\"%s\",\"reason\":%s}}\n",
         event_id, observed, kind, escaped,
-        mask, cookie, coverage);
+        mask, cookie, reconciliation ? "true" : "false", observation_count,
+        first_observed_json, last_observed_json, coverage, reason_json);
     if (n < 0 || (size_t)n >= sizeof(line)) { errno = EOVERFLOW; return -1; }
     size_t off = 0;
     while (off < (size_t)n) {
@@ -491,52 +546,320 @@ static int emit_event(int fd, const char *kind, const char *path, const char *co
     return 0;
 }
 
-static int cmd_watch(const char *root_arg, const char *events, const char *pidfile) {
+static int emit_event(int fd, const char *kind, const char *path, const char *coverage,
+                      uint32_t mask, uint32_t cookie) {
+    return emit_event_full(fd, kind, path, coverage, mask, cookie, NULL, 0, 1U, 0U, 0U);
+}
+
+static int emit_coverage_event(int fd, const char *path, const char *state,
+                               const char *reason, uint32_t mask) {
+    char kind[64];
+    int n = snprintf(kind, sizeof(kind), "coverage.%s", state);
+    if (n < 0 || (size_t)n >= sizeof(kind)) { errno = EOVERFLOW; return -1; }
+    return emit_event_full(fd, kind, path, state, mask, 0U, reason, 0, 0U, 0U, 0U);
+}
+
+static uint64_t clock_ns(clockid_t clock_id) {
+    struct timespec now;
+    if (clock_gettime(clock_id, &now) != 0 || now.tv_sec < 0) return 0U;
+    return (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
+}
+
+static void remove_pending_event(struct event_batch *batch, size_t index) {
+    if (index + 1U < batch->n)
+        memmove(&batch->rows[index], &batch->rows[index + 1U],
+                (batch->n - index - 1U) * sizeof(batch->rows[0]));
+    --batch->n;
+}
+
+static const char *pending_event_kind(const struct pending_file_event *event) {
+    int create = (event->mask & IN_CREATE) != 0;
+    int deleted = (event->mask & IN_DELETE) != 0;
+    if (create && deleted)
+        return (event->last_action_mask & IN_CREATE) ? "file.created" : "file.deleted";
+    if (deleted) return "file.deleted";
+    if (create) return "file.created";
+    if ((event->mask & IN_CLOSE_WRITE) == 0U && (event->mask & IN_ATTRIB) != 0U)
+        return "file.metadata_changed";
+    return "file.modified";
+}
+
+static int flush_pending_event(struct event_batch *batch, size_t index, int logfd,
+                               const char *coverage) {
+    const struct pending_file_event *event = &batch->rows[index];
+    if (emit_event_full(logfd, pending_event_kind(event), event->path, coverage,
+                        event->mask, 0U, NULL, 0, event->count,
+                        event->first_realtime_ns, event->last_realtime_ns) != 0) return -1;
+    remove_pending_event(batch, index);
+    return 0;
+}
+
+static int flush_pending_events(struct event_batch *batch, int logfd, const char *coverage) {
+    while (batch->n) if (flush_pending_event(batch, 0U, logfd, coverage) != 0) return -1;
+    return 0;
+}
+
+static int flush_expired_events(struct event_batch *batch, int logfd, const char *coverage) {
+    uint64_t now = clock_ns(CLOCK_MONOTONIC);
+    if (!now) return -1;
+    uint64_t window = (uint64_t)batch->window_ms * 1000000ULL;
+    for (size_t i = 0; i < batch->n;) {
+        uint64_t last = batch->rows[i].last_monotonic_ns;
+        if (now >= last && now - last >= window) {
+            if (flush_pending_event(batch, i, logfd, coverage) != 0) return -1;
+        } else {
+            ++i;
+        }
+    }
+    return 0;
+}
+
+static int pending_event_add(struct event_batch *batch, const char *path, uint32_t mask,
+                             int logfd, const char *coverage) {
+    uint64_t mono = clock_ns(CLOCK_MONOTONIC), realtime = clock_ns(CLOCK_REALTIME);
+    if (!mono || !realtime) return -1;
+    uint64_t window = (uint64_t)batch->window_ms * 1000000ULL;
+    for (size_t i = 0; i < batch->n; ++i) {
+        struct pending_file_event *event = &batch->rows[i];
+        if (strcmp(event->path, path) != 0) continue;
+        if (mono >= event->last_monotonic_ns && mono - event->last_monotonic_ns < window) {
+            event->mask |= mask;
+            uint32_t action = mask & (IN_CREATE | IN_DELETE);
+            if (action) event->last_action_mask = action;
+            if (event->count < UINT32_MAX) ++event->count;
+            event->last_monotonic_ns = mono;
+            event->last_realtime_ns = realtime;
+            return 0;
+        }
+        if (flush_pending_event(batch, i, logfd, coverage) != 0) return -1;
+        break;
+    }
+    if (batch->n == MAX_PENDING_EVENTS) {
+        size_t oldest = 0U;
+        for (size_t i = 1U; i < batch->n; ++i)
+            if (batch->rows[i].last_monotonic_ns < batch->rows[oldest].last_monotonic_ns)
+                oldest = i;
+        if (flush_pending_event(batch, oldest, logfd, coverage) != 0) return -1;
+    }
+    struct pending_file_event *event = &batch->rows[batch->n];
+    int n = snprintf(event->path, sizeof(event->path), "%s", path);
+    if (n < 0 || (size_t)n >= sizeof(event->path)) { errno = ENAMETOOLONG; return -1; }
+    event->mask = mask;
+    event->last_action_mask = mask & (IN_CREATE | IN_DELETE);
+    event->count = 1U;
+    event->first_monotonic_ns = mono;
+    event->last_monotonic_ns = mono;
+    event->first_realtime_ns = realtime;
+    event->last_realtime_ns = realtime;
+    ++batch->n;
+    return 0;
+}
+
+static int pending_poll_timeout(const struct event_batch *batch, int maximum_ms) {
+    if (batch->n == 0U) return maximum_ms;
+    uint64_t now = clock_ns(CLOCK_MONOTONIC);
+    if (!now) return maximum_ms;
+    uint64_t window = (uint64_t)batch->window_ms * 1000000ULL;
+    uint64_t remaining = UINT64_MAX;
+    for (size_t i = 0; i < batch->n; ++i) {
+        uint64_t last = batch->rows[i].last_monotonic_ns;
+        uint64_t deadline = last > UINT64_MAX - window ? UINT64_MAX : last + window;
+        uint64_t left = deadline > now ? deadline - now : 0U;
+        if (left < remaining) remaining = left;
+    }
+    uint64_t ms = (remaining + 999999ULL) / 1000000ULL;
+    if (ms > (uint64_t)maximum_ms) return maximum_ms;
+    return (int)ms;
+}
+
+static int rows_differ(const struct file_row *left, const struct file_row *right) {
+    return left->dev != right->dev || left->ino != right->ino ||
+           strcmp(left->hash, right->hash) != 0 || left->size != right->size ||
+           left->mtime_ns != right->mtime_ns || left->mode != right->mode ||
+           left->uid != right->uid || left->gid != right->gid;
+}
+
+static int emit_reconciliation_diff(int logfd, const char *root,
+                                    const struct rows *before, const struct rows *after) {
+    size_t i = 0, j = 0;
+    while (i < before->n || j < after->n) {
+        int order = i == before->n ? 1 : j == after->n ? -1 :
+                    strcmp(before->v[i].path, after->v[j].path);
+        const char *kind = NULL, *path = NULL;
+        if (order < 0) {
+            kind = "file.deleted"; path = before->v[i++].path;
+        } else if (order > 0) {
+            kind = "file.created"; path = after->v[j++].path;
+        } else {
+            if (strcmp(before->v[i].hash, after->v[j].hash) != 0 ||
+                before->v[i].size != after->v[j].size) {
+                kind = "file.modified";
+            } else if (rows_differ(&before->v[i], &after->v[j])) {
+                kind = "file.metadata_changed";
+            }
+            path = after->v[j].path; ++i; ++j;
+        }
+        if (kind) {
+            char full[PATH_MAX];
+            int n = snprintf(full, sizeof(full), "%s/%s", root, path);
+            if (n < 0 || (size_t)n >= sizeof(full)) { errno = ENAMETOOLONG; return -1; }
+            if (emit_event_full(logfd, kind, full, "recovering", 0U, 0U,
+                                "full_reconciliation", 1, 0U, 0U, 0U) != 0) return -1;
+        }
+    }
+    return 0;
+}
+
+static void free_watches(struct watches *ws) {
+    for (size_t i = 0; i < ws->n; ++i) free(ws->v[i].path);
+    free(ws->v);
+    memset(ws, 0, sizeof(*ws));
+}
+
+/* Returns 0 for complete watch+scan coverage, -1 for a visible degraded state,
+ * and -2 when the event journal itself cannot record the transition. */
+static int rebuild_and_reconcile(int *inofd, struct watches *ws, const char *root,
+                                 dev_t root_dev, struct rows *snapshot, int *have_snapshot,
+                                 struct event_batch *batch, int logfd, const char *reason) {
+    if (strcmp(reason, "watch_startup") != 0 &&
+        emit_coverage_event(logfd, root, "degraded", reason, 0U) != 0) return -2;
+    if (emit_coverage_event(logfd, root, "recovering", reason, 0U) != 0) return -2;
+    if (flush_pending_events(batch, logfd, "recovering") != 0) return -2;
+    if (*inofd >= 0) close(*inofd);
+    *inofd = -1;
+    free_watches(ws);
+    errno = 0;
+    *inofd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    int watch_error = 0;
+    int watches_ok = 0;
+    if (*inofd >= 0) {
+        errno = EIO;
+        watches_ok = add_tree_watches(*inofd, ws, root, root_dev, 0U) == 0;
+        if (!watches_ok) watch_error = errno;
+    } else {
+        watch_error = errno ? errno : EIO;
+    }
+
+    struct rows current = {0};
+    errno = EIO;
+    int scan_ok = scan_root(root, &current) == 0;
+    int scan_error = scan_ok ? 0 : errno;
+    if (scan_ok) {
+        if (*have_snapshot && emit_reconciliation_diff(logfd, root, snapshot, &current) != 0) {
+            free_rows(&current);
+            return -2;
+        }
+        free_rows(snapshot);
+        *snapshot = current;
+        *have_snapshot = 1;
+    } else {
+        free_rows(&current);
+    }
+
+    if (watches_ok && scan_ok) {
+        if (emit_coverage_event(logfd, root, "healthy", "reconciliation_complete", 0U) != 0)
+            return -2;
+        return 0;
+    }
+    const char *failure = !watches_ok && !scan_ok ? "watch_and_scan_failed" :
+                          !watches_ok ? "watch_registration_failed" : "full_scan_failed";
+    fprintf(stderr, "coverage degraded: %s (watch errno=%d, scan errno=%d)\n",
+            failure, watch_error, scan_error);
+    if (emit_coverage_event(logfd, root, "degraded", failure, 0U) != 0) return -2;
+    return -1;
+}
+
+static int cmd_watch(const char *root_arg, const char *events, const char *pidfile,
+                     int inject_overflow_once) {
     char root[PATH_MAX];
     if (canonical_root(root_arg, root) != 0) return fail("invalid or unsafe root");
-    int inofd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
-    if (inofd < 0) return fail("inotify_init1");
+    int inofd = -1;
     struct watches ws = {0};
     struct pending_renames renames = {0};
     int rootfd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     struct stat rootst;
     if (rootfd < 0 || fstat(rootfd, &rootst) != 0) {
         if (rootfd >= 0) close(rootfd);
-        close(inofd); return fail("open watch root");
+        return fail("open watch root");
     }
     close(rootfd);
-    if (add_tree_watches(inofd, &ws, root, rootst.st_dev, 0) != 0) {
-        close(inofd); return fail("watch registration failed");
-    }
     int logfd = open(events, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0600);
-    if (logfd < 0) { close(inofd); return fail("open event log"); }
+    if (logfd < 0) return fail("open event log");
+    struct event_batch batch = { .window_ms = EVENT_DEBOUNCE_MS };
+    batch.rows = calloc(MAX_PENDING_EVENTS, sizeof(*batch.rows));
+    if (!batch.rows) { close(logfd); return fail("allocate event coalescing table"); }
     int pfd = open(pidfile, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
-    if (pfd < 0) { close(logfd); close(inofd); return fail("pidfile exists or inaccessible"); }
+    if (pfd < 0) { free(batch.rows); close(logfd); return fail("pidfile exists or inaccessible"); }
     dprintf(pfd, "%ld\n", (long)getpid()); close(pfd);
     signal(SIGINT, on_signal); signal(SIGTERM, on_signal);
+    struct rows snapshot = {0};
+    int have_snapshot = 0;
+    int coverage_healthy = 0;
+    int recovery_rc = rebuild_and_reconcile(&inofd, &ws, root, rootst.st_dev,
+                                            &snapshot, &have_snapshot, &batch, logfd,
+                                            "watch_startup");
+    if (recovery_rc == -2) stopping = 1;
+    coverage_healthy = recovery_rc == 0;
+    unsigned int degraded_idle = 0;
+    int injected = 0;
+    int inject_ready = 0;
     unsigned char buf[EVENT_BUFFER];
-    puts("watching; Ctrl-C or fimctl stop will stop the monitor");
+    puts("watching; coverage is recorded in the event journal; Ctrl-C or fimctl stop will stop the monitor");
     while (!stopping) {
         struct pollfd p = { .fd = inofd, .events = POLLIN };
-        int ready = poll(&p, 1, 1000);
+        int had_pending_events = batch.n != 0U;
+        int ready = poll(&p, 1, pending_poll_timeout(&batch, 1000));
         if (ready < 0 && errno == EINTR) continue;
-        if (ready < 0) break;
-        if (ready == 0) {
-            if (expire_renames(&renames, logfd) != 0) { stopping = 1; break; }
-            continue;
+        int need_reconcile = 0;
+        const char *reconcile_reason = NULL;
+        if (ready < 0) {
+            need_reconcile = 1;
+            reconcile_reason = "poll_failed";
         }
-        ssize_t n = read(inofd, buf, sizeof(buf));
-        if (n < 0 && (errno == EAGAIN || errno == EINTR)) continue;
-        if (n < 0) break;
-        for (size_t off = 0; off < (size_t)n;) {
+        if (ready == 0) {
+            const char *coverage = coverage_healthy ? "healthy" : "degraded";
+            if (flush_expired_events(&batch, logfd, coverage) != 0 ||
+                expire_renames(&renames, logfd, coverage) != 0) {
+                stopping = 1; break;
+            }
+            if (inject_overflow_once && inject_ready && !injected && !had_pending_events) {
+                need_reconcile = 1;
+                reconcile_reason = "test_injected_queue_overflow";
+                injected = 1;
+            } else if (!coverage_healthy && !had_pending_events && ++degraded_idle >= 5U) {
+                need_reconcile = 1;
+                reconcile_reason = "watch_recovery_retry";
+                degraded_idle = 0;
+            }
+        }
+        ssize_t n = 0;
+        if (ready > 0) {
+            n = inofd >= 0 ? read(inofd, buf, sizeof(buf)) : -1;
+            if (n < 0 && (errno == EAGAIN || errno == EINTR)) continue;
+            if (n < 0) {
+                need_reconcile = 1;
+                reconcile_reason = "inotify_read_failed";
+                n = 0;
+            }
+        }
+        for (size_t off = 0; off < (size_t)n && !need_reconcile;) {
             struct inotify_event *ev = (struct inotify_event *)(void *)(buf + off);
             const char *base = watch_path(&ws, ev->wd);
             if (ev->mask & IN_Q_OVERFLOW) {
-                if (emit_event(logfd, "coverage.degraded", root, "degraded", ev->mask, 0) != 0) {
-                    stopping = 1; break;
-                }
-                fputs("coverage degraded: inotify queue overflow; run fimctl verify --full\n", stderr);
-            } else if (base) {
+                need_reconcile = 1;
+                reconcile_reason = "inotify_queue_overflow";
+                break;
+            }
+            if (ev->mask & (IN_IGNORED | IN_DELETE_SELF | IN_MOVE_SELF | IN_UNMOUNT)) {
+                need_reconcile = 1;
+                reconcile_reason = "watch_invalidated";
+                break;
+            }
+            if (!base) {
+                need_reconcile = 1;
+                reconcile_reason = "unknown_watch_descriptor";
+                break;
+            } else {
                 char full[PATH_MAX];
                 int k = ev->len && ev->name[0]
                     ? snprintf(full, sizeof(full), "%s/%s", base, ev->name)
@@ -547,18 +870,28 @@ static int cmd_watch(const char *root_arg, const char *events, const char *pidfi
                         ((ev->mask & IN_MOVED_TO) ? "file.moved_to" :
                         ((ev->mask & IN_CREATE) ? "file.created" :
                         ((ev->mask & IN_ATTRIB) ? "file.metadata_changed" : "file.modified"))));
-                    if (emit_event(logfd, kind, full, "healthy", ev->mask, ev->cookie) != 0) {
+                    const char *coverage = coverage_healthy ? "healthy" : "degraded";
+                    int direct_event = (ev->mask & (IN_MOVED_FROM | IN_MOVED_TO | IN_ISDIR)) != 0U;
+                    if ((direct_event && emit_event(logfd, kind, full, coverage,
+                                                    ev->mask, ev->cookie) != 0) ||
+                        (!direct_event && pending_event_add(&batch, full, ev->mask,
+                                                           logfd, coverage) != 0)) {
                         stopping = 1; break;
                     }
+                    inject_ready = 1;
                     if (ev->mask & IN_MOVED_FROM) {
-                        if (remember_rename(&renames, ev->cookie, full) != 0 &&
-                            emit_event(logfd, "file.rename_match_failed", full, "degraded",
-                                       ev->mask, ev->cookie) != 0) {
-                            stopping = 1; break;
+                        if (remember_rename(&renames, ev->cookie, full) != 0) {
+                            if (emit_event(logfd, "file.rename_match_failed", full, "degraded",
+                                           ev->mask, ev->cookie) != 0) {
+                                stopping = 1; break;
+                            }
+                            need_reconcile = 1;
+                            reconcile_reason = "rename_correlation_capacity";
                         }
                     } else if (ev->mask & IN_MOVED_TO) {
                         if (take_rename(&renames, ev->cookie)) {
-                            if (emit_event(logfd, "path.renamed", full, "healthy",
+                            if (emit_event(logfd, "path.renamed", full,
+                                           coverage_healthy ? "healthy" : "degraded",
                                            ev->mask, ev->cookie) != 0) {
                                 stopping = 1; break;
                             }
@@ -567,20 +900,39 @@ static int cmd_watch(const char *root_arg, const char *events, const char *pidfi
                             stopping = 1; break;
                         }
                     }
-                    if ((ev->mask & IN_CREATE) && (ev->mask & IN_ISDIR))
-                        (void)add_tree_watches(inofd, &ws, full, rootst.st_dev, 0);
-                }
-                if (ev->mask & IN_IGNORED) {
-                    for (size_t i = 0; i < ws.n; ++i) if (ws.v[i].wd == ev->wd) ws.v[i].wd = -1;
+                    if ((ev->mask & IN_CREATE) && (ev->mask & IN_ISDIR)) {
+                        need_reconcile = 1;
+                        reconcile_reason = "new_directory_discovered";
+                    }
+                    if ((ev->mask & (IN_MOVED_FROM | IN_MOVED_TO)) && (ev->mask & IN_ISDIR)) {
+                        need_reconcile = 1;
+                        reconcile_reason = "directory_tree_moved";
+                    }
                 }
             }
             off += sizeof(*ev) + ev->len;
         }
-        if (expire_renames(&renames, logfd) != 0) { stopping = 1; break; }
+        if (!stopping && !need_reconcile &&
+            (flush_expired_events(&batch, logfd,
+                                  coverage_healthy ? "healthy" : "degraded") != 0 ||
+             expire_renames(&renames, logfd,
+                            coverage_healthy ? "healthy" : "degraded") != 0)) {
+            stopping = 1; break;
+        }
+        if (!stopping && need_reconcile) {
+            recovery_rc = rebuild_and_reconcile(&inofd, &ws, root, rootst.st_dev,
+                                                &snapshot, &have_snapshot, &batch, logfd,
+                                                reconcile_reason ? reconcile_reason : "unknown_failure");
+            if (recovery_rc == -2) stopping = 1;
+            coverage_healthy = recovery_rc == 0;
+            degraded_idle = 0;
+        }
     }
+    (void)flush_pending_events(&batch, logfd, coverage_healthy ? "healthy" : "degraded");
     unlink(pidfile);
-    for (size_t i = 0; i < ws.n; ++i) free(ws.v[i].path);
-    free(ws.v); close(logfd); close(inofd);
+    free(batch.rows); free_watches(&ws); free_rows(&snapshot);
+    close(logfd);
+    if (inofd >= 0) close(inofd);
     return 0;
 }
 
@@ -649,13 +1001,18 @@ static void usage(void) {
          "fimctl verify --db FILE [--full] [--format json]\n"
          "fimctl status --db FILE\n"
          "fimctl export --db FILE --out FILE\n"
-         "fimctl watch --root DIR --events FILE [--pidfile FILE]\n"
+         "fimctl watch --root DIR --events FILE [--pidfile FILE] [--inject-overflow-once]\n"
          "fimctl stop [--pidfile FILE]");
 }
 
 static const char *option(int argc, char **argv, const char *name, const char *fallback) {
     for (int i = 2; i + 1 < argc; ++i) if (!strcmp(argv[i], name)) return argv[i + 1];
     return fallback;
+}
+
+static int has_flag(int argc, char **argv, const char *name) {
+    for (int i = 2; i < argc; ++i) if (!strcmp(argv[i], name)) return 1;
+    return 0;
 }
 
 int main(int argc, char **argv) {
@@ -665,7 +1022,7 @@ int main(int argc, char **argv) {
         const char *events = option(argc, argv, "--events", NULL);
         const char *pidfile = option(argc, argv, "--pidfile", "./fimd.pid");
         if (!root || !events) { usage(); return 2; }
-        return cmd_watch(root, events, pidfile);
+        return cmd_watch(root, events, pidfile, has_flag(argc, argv, "--inject-overflow-once"));
     }
     if (!strcmp(argv[1], "stop")) return cmd_stop(option(argc, argv, "--pidfile", "./fimd.pid"));
     const char *dbpath = option(argc, argv, "--db", NULL);
