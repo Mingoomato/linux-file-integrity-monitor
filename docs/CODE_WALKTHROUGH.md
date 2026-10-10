@@ -1,39 +1,59 @@
 # Code Walkthrough — Linux File Integrity Monitor
 
-This walkthrough follows the checked-in code rather than an idealized production design. The single C translation unit is intentionally compact; function names below are the best navigation points.
+This guide describes the implementation currently in `src/fimctl.c`. The repository was built as a compact Linux systems lab: students can trace a baseline scan, an inotify event, a stable hash, an event-journal record, and a recovery scan in one C translation unit. The single-file layout keeps the learning path short; it is not a claim that a production monitor should put every subsystem in one file.
 
-## 1. CLI and root boundary
+## 1. CLI, root, and baseline database
 
-Start at `main` in `src/fimctl.c`. It dispatches `init`, `scan`, `verify`, `status`, `export`, `watch`, and `stop`. `canonical_root` converts the user-supplied root to an absolute canonical path, checks that it is an existing directory, and rejects broad system roots. Root-taking operations use that result before touching monitored paths.
+Start at `main`. It dispatches `init`, `scan`, `verify`, `status`, `export`, `watch`, and `stop`. Root-taking commands pass through `canonical_root`. The watcher requires `--root`, `--db`, and `--events`; it opens the baseline database read-only and rejects a root that differs from the root stored in the database. `--verify-interval-seconds` accepts one value from 1 through 86,400; it defaults to 3,600 seconds.
+
+`db_open_readonly` checks the schema version. `load_rows` reads sorted baseline rows into an in-memory snapshot and rejects malformed or escaping relative paths before they can be used for reconciliation. Watch operation never updates the database. This is a deliberate separation: `init` and `scan` manage a baseline, while `watch` records observations and current-state differences.
 
 ## 2. Scanner and file identity
 
-`scan_root` opens the selected directory with `O_DIRECTORY | O_NOFOLLOW`, gets the root device with `fstat`, and calls `scan_dir`.
+`scan_root` opens the selected root with `O_DIRECTORY | O_NOFOLLOW`, gets its device number with `fstat`, and calls `scan_dir`.
 
-`scan_dir` uses `dup` + `fdopendir` so each recursive frame can enumerate its own directory stream while retaining the directory FD for relative operations. `fstatat` with `AT_SYMLINK_NOFOLLOW` inspects an entry without following a symlink. Directories are opened by `openat` with `O_DIRECTORY | O_NOFOLLOW`; regular files are opened by `openat` with `O_NOFOLLOW`. The scanner skips a different `st_dev`, symlinks, special files, files above its fixed size limit, and excessive recursion depth.
+`scan_dir` duplicates each directory FD for `fdopendir`, so `closedir` owns the duplicate while relative operations retain the original. `fstatat(..., AT_SYMLINK_NOFOLLOW)` inspects entries without following symlinks. Child directories and files are opened relative to the directory FD with `openat` and `O_NOFOLLOW`. The scanner skips symbolic links, special files, other devices, oversized files, and excessive recursion depth.
 
-For a file, the flow is `openat` → `fstat` before → `hash_fd` → `fstat` after → `same_file_state`. A mismatch aborts the scan with an unstable-file error. `hash_fd` initializes an EVP digest context, reads chunks, updates SHA-256, finalizes a 32-byte digest, and renders lowercase hexadecimal. `push_row` transfers the path allocation to the row vector. After traversal, `row_path_compare` lets `scan_root` sort rows.
+For each regular file, the sequence is `openat` → `fstat` before → `hash_fd` → `fstat` after → `same_file_state`. The state comparison includes device, inode, size, mtime, ctime, mode, UID, and GID. A changed state makes a full scan fail instead of committing a potentially mixed digest. `hash_fd` reads 64 KiB chunks and feeds OpenSSL EVP SHA-256. `push_row` transfers the allocated relative path to a row vector; `scan_root` sorts rows by path.
 
-## 3. Persistence and comparison
+## 3. Persistence and full verification
 
-`db_open` opens SQLite, enables WAL and `synchronous=FULL`, creates the schema if needed, and accepts only the supported schema version. `store_rows` begins an immediate transaction, writes the root record, replaces file rows, and commits; an intermediate failure requests rollback. Each row records relative path, device, inode, mode, UID, GID, size, nanosecond mtime, and digest.
+`db_open` enables SQLite WAL and `synchronous=FULL`. `store_rows` uses a transaction to replace file rows and root metadata, rolling back on an intermediate failure. Each row stores the relative path, device, inode, mode, UID, GID, size, nanosecond mtime, and SHA-256.
 
-`compare_rows` walks stored rows ordered by path and the sorted scan vector together. A missing old path becomes deleted; a new path becomes created; a changed digest/size becomes modified; otherwise metadata differences become metadata_changed. This sorted merge uses bounded per-row state rather than a second hash map. The comparison is a current-state comparison; it does not infer an unobserved rename.
+`verify` creates a fresh sorted scan and `compare_rows` merges it with database rows in path order. It reports created, deleted, modified, and metadata-changed paths. This comparison is a current-state comparison; it does not prove when a change happened. Full verification currently does not infer a rename by matching inode or content across two paths.
 
-## 4. Watcher and event journal
+## 4. Watch startup and initial reconciliation
 
-`cmd_watch` opens the event journal and PID file, then `rebuild_and_reconcile` creates `inotify_init1(IN_NONBLOCK | IN_CLOEXEC)`, verifies the root device, and calls `add_tree_watches`. It takes an initial `scan_root` snapshot after installing watches. `watch_add` subscribes to create/delete/write-close/attribute/move and watch-invalidation signals and stores the mapping from kernel watch descriptor to path. `add_tree_watches` walks existing directories and avoids symlink and device-crossing paths.
+`cmd_watch` opens the event journal, creates a protected PID file, opens the root directory FD, loads the database snapshot, and calls `rebuild_and_reconcile`. That function creates a nonblocking inotify FD, recursively installs directory watches with `watch_add` and `add_tree_watches`, and scans the current tree. The first scan is compared to the loaded baseline snapshot, so changes made since `init` or the last `scan` are recorded with before/after hashes and `reconciliation=true`. Only a successful watch installation and scan produce `coverage.healthy`.
 
-The event loop uses `poll` and `read`. Each read can contain multiple variable-length `inotify_event` records, so the cursor advances by `sizeof(*ev) + ev->len`. The watch descriptor selects a base path; the optional event name appends a child. Event masks are mapped to an event kind and passed to `emit_event`.
+The event loop calls `poll`, reads variable-length `struct inotify_event` records, resolves a watch descriptor to its watched path, and appends the event name. `IN_MOVED_FROM` and `IN_MOVED_TO` use a bounded cookie table. A paired cookie emits `path.renamed`; a move-in without its peer and a move-out whose peer times out are represented separately rather than guessed to be a rename.
 
-`emit_event_full` escapes the path and optional reason, generates a UUID-like event ID through OpenSSL random bytes, formats a UTC timestamp, and writes one complete line with retries for `EINTR` and partial writes. Ordinary events set `evidence.reconciliation=false`; scan-derived differences set it to `true` and have no inotify mask. Non-rename signals enter a fixed 256-entry table for a 100 ms quiet window. `pending_event_add` ORs masks, increments the raw count, and records first/last realtime nanoseconds; `pending_poll_timeout` wakes at the nearest flush deadline. The oldest row flushes early if the table fills, and shutdown/recovery flush all rows. `pending_event_kind` chooses the summary type while the combined mask and signal count preserve the input evidence. The smoke test asserts a multi-signal file-write burst is emitted as one record with ordered timestamps. The actor is explicitly unknown. On `IN_MOVED_FROM`, `remember_rename` copies the path and monotonic timestamp into a fixed 256-slot table keyed by cookie. On `IN_MOVED_TO`, `take_rename` removes the matching entry and emits `path.renamed`; a missing cookie emits `file.rename_match_failed`. Rename records bypass coalescing. Entries still pending after the timeout emit `file.rename_timeout`.
+## 5. Debounce, hashing, and journal evidence
 
-Overflow, an invalidated watch descriptor, or a directory-tree change enters `rebuild_and_reconcile`: emit a `recovering` coverage event, close and recreate the inotify instance, free and rebuild the watch-path table, run a full scan, and merge the old and new sorted row vectors. The merge reports created/deleted/content/metadata changes, including inode identity changes, with `full_reconciliation` evidence. A complete watch install plus scan emits `healthy`; otherwise the process logs `degraded` and retries after idle timeouts. The SQLite baseline is not rewritten. `--inject-overflow-once` reaches this path deterministically in tests, but does not generate a kernel `IN_Q_OVERFLOW` record.
+Non-rename signals enter a bounded 256-entry table keyed by path. The watcher ORs event masks, increments the raw observation count, and remembers first/last wall-clock timestamps. A 100 ms quiet window is measured using `CLOCK_MONOTONIC`; the recorded timestamps use `CLOCK_REALTIME` so they can be compared with other logs. The oldest entry flushes early if the table fills. Shutdown and coverage recovery flush pending entries as well.
 
-## 5. Shutdown and lifetime audit
+`flush_pending_event` derives a root-relative path and calls `scan_relative_file`. That helper walks each path component from the already-open root FD using `openat`, `O_DIRECTORY`, and `O_NOFOLLOW`; it opens the final file with `O_NOFOLLOW | O_NONBLOCK`. It hashes only a same-device regular file and compares metadata before and after hashing. An `EAGAIN` stability result is retried up to two times with a short delay. The new file row is compared to the current in-memory snapshot and classified as created, modified, deleted, metadata-changed, unchanged, or unknown. Successful state changes update the in-memory snapshot, not the SQLite database. Event evidence can include `before_sha256`, `after_sha256`, `error_errno`, the combined mask, count, and observation-time range.
 
-The signal handler sets `stopping`; it does not call `printf`, `free`, SQLite, or `close`. Once control returns to the loop, the cleanup path unlinks the PID file, frees watch-path strings and the watch vector, frees the in-memory scan snapshot, and closes the event and inotify FDs. Review every new `goto`/early return in this function against the opened resource list: `inofd`, `rootfd`, `logfd`, PID file, `ws` allocations, and snapshot row paths.
+The debounce is synchronous in the event loop. There is no worker pool or job queue, so there are no shared worker-owned rows or queue shutdown races; a slow file read or journal write can delay processing the next inotify batch. The pending tables remain bounded, but they do not make the kernel notification stream lossless.
 
-## 6. Tests and limits
+## 6. Overflow recovery and periodic verification
 
-`tests/smoke.sh` creates a temporary tree and exercises baseline/verify/export/watch/shutdown, multi-signal coalescing, paired and unmatched moves, move timeout, recursive watch addition and directory-move recovery, and synthetic overflow reconciliation for created/deleted/metadata changes. Its pass does not prove behavior under a real kernel queue overflow, watch-resource exhaustion, concurrent mutation, DB corruption, disk-full behavior, or large-tree resource use. The code has no multithreaded scanner, baseline-aware hash debounce, or hash queue; concurrency risk mainly concerns external filesystem changes while a scan is running.
+An `IN_Q_OVERFLOW`, invalidated watch, unknown watch descriptor, watch/read/poll failure, rename-table exhaustion, or directory-tree change enters `rebuild_and_reconcile`. The function emits `coverage.recovering`, flushes pending rows, replaces the inotify instance and recursive watch table, scans the tree, and compares that scan with the last successful in-memory snapshot. Scan-derived differences include hashes and `reconciliation=true`. It emits `coverage.healthy` only when both watch registration and the full scan succeed; otherwise it records a degraded reason and retries after idle periods. The database baseline is not rewritten.
+
+`verify_current_snapshot` performs a full current-tree scan at the configured interval, defaulting to one hour. It emits `periodic_verification` and `periodic_verification_complete` coverage events. A successful scan updates the in-memory snapshot after writing differences. A failed scan records a degraded coverage event and keeps the previous successful snapshot. The test option `--inject-overflow-once` exercises the recovery state machine, but it does not make the kernel produce a real `IN_Q_OVERFLOW`.
+
+## 7. Ownership, shutdown, and failure review
+
+- `scan_root` owns a row vector; `push_row` transfers each path allocation and `free_rows` releases it.
+- `fdopendir` owns the duplicated directory FD. The caller closes the original directory FD and each `openat` child/file FD.
+- SQLite statements are finalized after use. SQLite copies bound strings where `SQLITE_TRANSIENT` is used. Watch DB handles are opened read-only and closed on exit.
+- The watcher owns the root, inotify, journal, and PID-file lifecycle; the watch-path strings; the current in-memory snapshot; and the bounded pending tables. The kernel keeps watch registrations until the inotify FD closes.
+- The signal handler sets a `volatile sig_atomic_t` flag only. Ordinary control flow flushes pending observations, unlinks the PID file, frees row/path allocations, and closes FDs.
+
+Relevant failures include permission denial, vanished files, symlink replacement, `EAGAIN` from a changing file, `EMFILE`, filesystem I/O failure, journal write failure, watch exhaustion, queue overflow, and process termination. A current-state scan cannot recreate intermediate writes or actor identity. The automated overflow case is synthetic; actual kernel queue pressure is still unverified.
+
+## 8. Tests and remaining limits
+
+`tests/smoke.sh` covers baseline creation and comparison, startup reconciliation hashes, event coalescing, hashed create/delete/metadata observations, interval parsing, periodic full verification, synthetic overflow recovery state transitions, paired/unmatched/expired moves, recursive directory-watch recovery, baseline immutability during watch, and shutdown. GCC Release, Clang Release, and ASan/UBSan CTest runs use each build's own executable.
+
+The smoke test does not prove genuine kernel queue overflow behavior, watch-limit recovery, event-log ENOSPC behavior, mount-boundary handling, stable hashing under synchronized concurrent mutation, large-tree performance, or the Ubuntu/RockyOS matrix. See `docs/TEST_RESULTS.md` for the current evidence and open gates.

@@ -22,7 +22,10 @@
         "reconciliation": {"type": "boolean"},
         "observation_count": {"type": "integer", "minimum": 0},
         "first_observed_unix_ns": {"type": ["integer", "null"], "minimum": 0},
-        "last_observed_unix_ns": {"type": ["integer", "null"], "minimum": 0}
+        "last_observed_unix_ns": {"type": ["integer", "null"], "minimum": 0},
+        "before_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+        "after_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+        "error_errno": {"type": ["integer", "null"], "minimum": 0}
       }
     },
     "coverage": {"type": "object", "required": ["state"], "properties": {"state": {"enum": ["healthy", "degraded", "unsupported", "recovering"]}, "reason": {"type": ["string", "null"]}}}

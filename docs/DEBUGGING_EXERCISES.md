@@ -1,58 +1,55 @@
 # Debugging and Independent Reproduction Exercises
 
-These exercises are intentionally unsolved. Attempt one before asking for a walkthrough. No complete solution or patch is included here. Use a disposable directory under `/tmp`; do not point experiments at personal or system data.
+These three exercises are intentionally unsolved. Each is a bounded implementation task that can be built and tested independently from the rest of the repository. Do not look for a complete solution in the docs; none is included. Use temporary fixtures under `/tmp`, never personal or system data.
 
-## Exercise 1 — Watch resource failure and retry
+## Exercise 1 — Stable descriptor hash
 
-**Goal:** Verify that partial recursive watch registration remains visibly degraded and can recover after the resource constraint is removed.
+**Goal:** Reproduce the scanner's guarantee that a digest is associated with a file state that remained stable during the read.
 
-**Starting points:** `watch_add`, `add_tree_watches`, `rebuild_and_reconcile`, and `tests/smoke.sh`.
-
-**Tasks:**
-
-1. Add a test-only, bounded way to force a recursive watch-registration failure without changing host sysctls.
-2. Assert that the journal records `coverage.degraded` and does not claim healthy coverage while a directory is unwatched.
-3. Remove the injected constraint and demonstrate that a later retry rebuilds the watch tree and returns to healthy coverage.
-4. Verify that a child file created during the degraded interval appears in the reconciliation report when observable.
-
-**Constraints:** Keep the watcher read-only. Do not follow symlinks or cross the root device. Do not lower or modify host-wide inotify limits. Do not silently convert a watch error into a healthy event.
-
-**Acceptance:** The test is repeatable, bounded, and distinguishes persistent watch failure from a quiet directory and successful recovery.
-
-## Exercise 2 — Coalescer capacity and no-drop behavior
-
-**Goal:** Verify bounded coalescer behavior when more distinct paths become pending than the table can hold.
-
-**Starting points:** `pending_event_add`, `flush_pending_event`, `pending_poll_timeout`, and `tests/smoke.sh`.
+**Starting points:** `hash_fd`, `same_file_state`, `scan_relative_file`.
 
 **Tasks:**
 
-1. Generate distinct file events for more than 256 paths before their quiet windows expire.
-2. Verify that the oldest record flushes early, every observed path still appears, and its mask/count/time-range evidence remains valid.
-3. Add a deterministic assertion that the table stays within its bound and no record is silently dropped.
-4. Consider whether an explicit coalesced/early-flush marker would help operators distinguish capacity pressure from an ordinary quiet-window flush.
+1. In a small standalone C test helper or isolated exercise file, open one regular file and compute its SHA-256 through a file descriptor.
+2. Record the file state before and after reading and return a distinct unstable result when the state changes.
+3. Add one ordinary success case and one deterministic or synchronized mutation case using a file your test created itself.
 
-**Constraints:** Keep memory bounded. Do not fill the host filesystem or hash/modify unrelated files. Keep actor attribution unknown and make any loss visible.
+**Constraints:** Do not follow a final symlink. Do not read the whole file into memory. Do not change files outside the test fixture.
 
-**Acceptance:** Tests prove the 257th distinct pending path does not silently discard an earlier observation and that all evidence fields remain internally consistent.
+**Acceptance:** A stable fixture produces the expected digest; a mutation is not silently reported as a stable digest; every opened FD and digest context is released on success and error paths.
 
-## Exercise 3 — Stable file hashing under concurrent mutation
+## Exercise 2 — Sorted baseline diff
 
-**Goal:** Add a focused test for the `fstat` before/hash/after stability contract.
+**Goal:** Independently implement the small merge operation used to compare sorted path rows.
 
-**Starting points:** `scan_dir`, `hash_fd`, `same_file_state`, and the unstable-file error path.
+**Starting points:** `struct file_row`, `row_path_compare`, `compare_rows`, `emit_reconciliation_diff`.
 
 **Tasks:**
 
-1. Create a large temporary file and mutate it while a scan runs.
-2. Check whether the scan fails clearly, retries, or records a digest.
-3. Add a test seam or deterministic synchronization point rather than relying only on timing luck.
-4. Verify that a failed scan does not replace the committed baseline with partial rows.
+1. Create two small, sorted arrays of path/hash/metadata rows.
+2. Classify paths present on only one side and paths with changed content or metadata.
+3. Add fixtures for one create, one delete, one content change, one metadata-only change, and identical arrays.
 
-**Constraints:** Do not add file writes to the monitor. The test harness may mutate only its own temporary fixture. Keep memory bounded.
+**Constraints:** Keep the implementation linear in the number of rows after sorting. Do not treat a same-content path difference as proof of a rename.
 
-**Acceptance:** A mutation during hashing cannot be reported as a successful stable digest; the baseline transaction remains all-or-nothing.
+**Acceptance:** The output is deterministic, every input row is accounted for once, and content changes are distinguishable from metadata-only changes.
+
+## Exercise 3 — Bounded event coalescer
+
+**Goal:** Reproduce the event table's bounded burst aggregation without implementing inotify itself.
+
+**Starting points:** `struct event_batch`, `pending_event_add`, `pending_poll_timeout`, `flush_pending_event`.
+
+**Tasks:**
+
+1. Add signals for the same path and verify the aggregate retains the combined mask, observation count, and first/last timestamps.
+2. Add a signal after the quiet window and verify it starts a new aggregate.
+3. Fill a small fixed-capacity table and define how an incoming distinct path is handled without silently dropping prior evidence.
+
+**Constraints:** Measure quiet time monotonically. Keep memory bounded and preserve an explicit outcome for capacity pressure.
+
+**Acceptance:** Tests cover repeated path, expired quiet window, capacity pressure, and cleanup; no aggregate exceeds the configured table bound.
 
 ## Owner attempt record
 
-Record the chosen exercise, a short design note, test evidence, and unresolved questions in the owner’s own notes. The repository does not infer completion from a build or a submitted patch. The owner’s reproduction status is currently **not yet evidenced**.
+After attempting an exercise, record the exercise number, your design, code/test evidence, and unresolved questions in your own notes. Repository implementation status and owner reproduction status are tracked separately. Owner reproduction is currently **not yet evidenced**; no mastery claim is made.

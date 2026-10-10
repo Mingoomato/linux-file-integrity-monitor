@@ -2,45 +2,51 @@
 
 ## Directory file descriptors and `*at` operations
 
-The scanner treats an opened directory FD as the anchor for its children. `fstatat(dirfd, name, ..., AT_SYMLINK_NOFOLLOW)` inspects one entry relative to that anchor. `openat` then opens the child relative to the same directory. This narrows races compared with repeatedly resolving a full path from the process working directory. `O_NOFOLLOW` rejects a symlink at the final component; it does not make every pathname race impossible, so the code still compares file state and restricts traversal.
+The scanner treats an opened directory FD as the anchor for its children. `fstatat(dirfd, name, ..., AT_SYMLINK_NOFOLLOW)` inspects one entry relative to that anchor. `openat` opens a child relative to the same directory. This narrows races compared with repeatedly resolving an absolute pathname from the process working directory. `O_NOFOLLOW` rejects a symlink at the final component; it does not make every pathname race impossible, so the code also compares file state and restricts traversal.
 
-The device-number comparison (`st_dev`) is a simple mount-crossing boundary. It can skip legitimate submount content, and it is not a complete mount-namespace policy. The project does not use `openat2(RESOLVE_BENEATH)`; that is a stronger Linux-specific alternative when an application needs kernel-enforced path-resolution constraints.
+The device-number comparison (`st_dev`) is a simple mount-crossing boundary. It may skip legitimate submount content and is not a complete mount-namespace policy. The project does not use `openat2(RESOLVE_BENEATH)`; that is a stronger Linux-specific alternative when kernel-enforced resolution constraints are needed.
 
 ## Hashing a changing file
 
-`fstat` reports metadata for the opened object, while `read` consumes bytes from the file description. Comparing metadata before and after hashing catches many concurrent changes, but not every possible same-size/same-timestamp rewrite on filesystems with coarse timestamp resolution. A filesystem snapshot or write-quiesce protocol is needed for a stronger point-in-time guarantee. SHA-256 gives a content fingerprint; it does not authenticate who created the file or protect the stored digest from an attacker who can rewrite the DB.
+`fstat` reports metadata for the opened object, while `read` consumes bytes from the file description. The code compares device, inode, size, mtime, ctime, mode, UID, and GID before and after reading. A difference is treated as an unstable read. For coalesced watch events, a short debounce lets a burst settle before reopening the current path. An `EAGAIN` stability result is retried up to two times with short sleeps; other failures become an explicit unknown observation with errno.
+
+This catches many concurrent writes, but does not create a filesystem snapshot. Same-size rewrites, filesystem timestamp behavior, and changes after the final `fstat` can still limit what one observation proves. A snapshot or write-quiesce protocol is needed for stronger point-in-time consistency. SHA-256 fingerprints content; it does not identify an author or protect a stored digest from an attacker who can rewrite the DB.
 
 ## inotify lifecycle and event structure
 
-`inotify_init1` returns a file descriptor for an inotify instance. `inotify_add_watch` attaches a watch and returns a watch descriptor. Reading that FD returns a packed sequence of `struct inotify_event` records, each followed by a variable-length name. `poll` allows this nonblocking FD to be integrated with a timeout and shutdown checks.
+`inotify_init1` returns an FD for an inotify instance. `inotify_add_watch` attaches a watch and returns a watch descriptor. Reading that FD returns a packed sequence of `struct inotify_event` records, each followed by a variable-length name. `poll` integrates the nonblocking FD with a timeout and shutdown checks.
 
 Important semantics:
 
-- Watches are not recursive; the application must add one for each directory and for newly created directories.
-- Rename events can arrive as `IN_MOVED_FROM` and `IN_MOVED_TO` with a shared cookie, but a pair may be outside the watched tree or one side may be lost.
-- Events can be coalesced; inotify is not a durable event log and does not report a reliable actor PID.
-- `IN_Q_OVERFLOW` means events were dropped. The watcher enters `recovering`, replaces the inotify instance and recursive watch set, then takes a fresh state scan. The scan can recover current state, but it cannot reconstruct intermediate actions.
-- Watching pathnames creates race windows when directories are renamed/replaced. An inotify watch follows the watched inode, not a promise that the pathname remains the same object.
-- A newly created or moved directory triggers a whole-tree watch rebuild and scan. This closes the gap where files appear before a newly created directory's watch is installed, at the cost of rescanning the full selected tree.
+- Watches are not recursive; the application installs a watch for each directory and must handle newly created or moved directories.
+- Rename notifications can arrive as `IN_MOVED_FROM` and `IN_MOVED_TO` with a shared cookie, but one side may be outside the watched tree or lost.
+- Events may be coalesced; inotify is not a durable event log and does not provide a reliable actor PID.
+- `IN_Q_OVERFLOW` means events were dropped. The watcher records degraded/recovering coverage, replaces the inotify instance and recursive watch set, then scans current state. That scan can identify the current difference but cannot reconstruct intermediate actions.
+- A watch follows an inode, not a promise that the original pathname continues to refer to that object. Pathname-based watch registration still has races.
+- A new or moved directory triggers a full watch rebuild and scan. This closes the gap where a child appears before its directory watch is installed, at the cost of rescanning the selected tree.
 
-The watcher keeps a fixed-capacity table of pending `IN_MOVED_FROM` cookies with monotonic timestamps. A matching `IN_MOVED_TO` emits a paired rename event; a move-in without a matching cookie and a move-out that exceeds the timeout are recorded as different uncertain outcomes. This preserves raw evidence and avoids inventing a rename. The table is bounded to 256 entries. On recovery, sorted scan rows are compared by relative path, SHA-256, size, metadata, device, and inode. The event journal marks scan-derived differences with `evidence.reconciliation=true` and `event_mask=0`, so they can be distinguished from raw kernel notifications. `coverage.healthy` means the complete recursive watch installation and a full current-state scan both succeeded; it does not mean that earlier event history is complete.
+## Hash debounce and periodic verification
 
-Other file notifications use a second bounded table keyed by full path. A 100 ms quiet window is measured with `CLOCK_MONOTONIC`, so wall-clock adjustments do not extend or shorten the debounce interval. The first and last signal times are separately recorded with `CLOCK_REALTIME` as Unix nanoseconds for human correlation. The record ORs masks and retains the raw signal count. When all 256 slots are occupied, the oldest entry flushes early rather than being discarded. Rename observations bypass this coalescer because their cookies and ordering matter.
+A 100 ms quiet window is measured with `CLOCK_MONOTONIC`; the event record's first/last observation times use `CLOCK_REALTIME` nanoseconds. The bounded coalescer preserves the OR-ed mask and raw signal count. When the quiet window expires, the event loop walks from a persistent root directory FD with `openat`, `O_DIRECTORY`, and `O_NOFOLLOW`, then opens the final file with `O_NOFOLLOW | O_NONBLOCK`. `O_NONBLOCK` prevents a path replaced by a FIFO from hanging the watcher before it checks the file type. The watcher hashes a same-device regular file and compares it with the current in-memory row. A baseline difference is reported with before/after SHA-256 values; a failed hash becomes `file.unknown` with `error_errno`.
 
-The regression suite uses `--inject-overflow-once` to exercise the same recovery state machine. It does not cause the kernel to emit a genuine `IN_Q_OVERFLOW`; testing actual queue limits and sustained load still requires a controlled fixture.
+The work is synchronous on the event-loop thread. There is no worker queue, so the fixed path table bounds pending notifications but does not bound time spent hashing one large file. A worker design would need backpressure and a policy for paths that change again while a job is pending.
+
+The interval option accepts 1 to 86,400 seconds and defaults to 3,600 seconds. Periodic verification scans the complete tree and compares it with the last successful in-memory snapshot. It can notice current-state changes after a missed inotify event. It does not update the SQLite baseline or reconstruct the missed event sequence. A scan failure emits degraded coverage and keeps the previous snapshot.
 
 ## SQLite durability boundary
 
-WAL allows readers and a writer to make progress with separate log and database files, but it does not make a multi-file filesystem scan atomic. The project uses a DB transaction for replacing baseline rows and `synchronous=FULL` for stronger commit durability. Watch recovery keeps its last successful scan snapshot only in memory and does not mutate the SQLite baseline. A crash can still occur between the filesystem scan and transaction; the next full scan is a new observation, not a reconstruction of the crash interval.
+WAL allows readers and a writer to make progress with separate log and database files, but it does not make a filesystem scan atomic. Baseline replacement uses a transaction and `synchronous=FULL` for stronger commit durability. The watcher opens the baseline read-only and keeps its evolving snapshot in memory. A crash between filesystem state and a journal write may leave an incomplete observation; the next scan is a new current-state view, not a reconstruction of the crash interval.
 
 ## Resource and error semantics
 
-FDs are process resources and must be closed on all exits. `fdopendir` takes ownership of its FD; `dup` is used to avoid closing the directory FD needed by `fstatat`/`openat`. `EINTR` may require retry for I/O calls; `EAGAIN` is expected when reading the nonblocking inotify FD with no ready event. `ENOSPC` on the event journal must be treated as evidence loss, not success. The watcher stops when a journal write fails; consistent nonzero exit status and explicit journal-failure coverage state remain hardening work. The directory-row snapshot and watch-path table are process-owned heap allocations; recovery frees the old watch table and replaces snapshot rows only after a successful full scan.
+FDs are process resources and must close on all exits. `fdopendir` takes ownership of its FD; `dup` keeps the directory FD available for `fstatat` and `openat`. `EINTR` may require retry for I/O calls; `EAGAIN` is expected when a nonblocking inotify FD has no queued event and can also signal a file changed during hashing. `ENOSPC` on the journal is evidence loss, not success. The watcher stops on journal write failure; an explicit aggregate lost-event counter is not implemented.
+
+The row snapshot, watch-path strings, and coalescer storage are process-owned. Recovery frees old watch-path storage and replaces snapshot rows only after a successful scan. The event loop is single-threaded, so there are no concurrent access races inside the monitor, but slow scans can delay notification reads.
 
 ## Official references
 
-- [`inotify(7)`](https://man7.org/linux/man-pages/man7/inotify.7.html) and [`inotify_add_watch(2)`](https://man7.org/linux/man-pages/man2/inotify_add_watch.2.html)
-- [`openat(2)`](https://man7.org/linux/man-pages/man2/openat.2.html), [`stat(2)`](https://man7.org/linux/man-pages/man2/stat.2.html), [`poll(2)`](https://man7.org/linux/man-pages/man2/poll.2.html), [`read(2)`](https://man7.org/linux/man-pages/man2/read.2.html)
-- [Linux `openat2(2)`](https://man7.org/linux/man-pages/man2/openat2.2.html) for a stronger resolution API
-- [SQLite WAL](https://www.sqlite.org/wal.html) and [atomic commit](https://www.sqlite.org/atomiccommit.html)
+- [`inotify(7)`](https://man7.org/linux/man-pages/man7/inotify.7.html), [`inotify_add_watch(2)`](https://man7.org/linux/man-pages/man2/inotify_add_watch.2.html), [`inotify_init1(2)`](https://man7.org/linux/man-pages/man2/inotify_init1.2.html)
+- [`openat(2)`](https://man7.org/linux/man-pages/man2/openat.2.html), [`openat2(2)`](https://man7.org/linux/man-pages/man2/openat2.2.html), [`stat(2)`](https://man7.org/linux/man-pages/man2/stat.2.html)
+- [`poll(2)`](https://man7.org/linux/man-pages/man2/poll.2.html), [`read(2)`](https://man7.org/linux/man-pages/man2/read.2.html), [`fdopendir(3)`](https://man7.org/linux/man-pages/man3/fdopendir.3.html)
+- [SQLite WAL](https://www.sqlite.org/wal.html), [SQLite atomic commit](https://www.sqlite.org/atomiccommit.html)
 - [OpenSSL EVP digest API](https://docs.openssl.org/3.0/man3/EVP_DigestInit/)

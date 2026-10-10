@@ -4,59 +4,84 @@
 
 ## 한국어
 
-`fimctl`은 사용자가 명시한 실습 디렉터리의 일반 파일을 SHA-256 기준선으로 기록하고, 나중의 전체 스캔과 비교하는 읽기 전용 파일 무결성 모니터입니다. `watch`는 inotify 신호를 로컬 NDJSON으로 남깁니다. 목적은 디렉터리 FD 기반 파일 순회, 안정적인 해시 계산, SQLite 상태 저장, Linux 파일 이벤트의 한계와 복구 필요성을 학습하는 것입니다. 차단·자동 복구·행위자 식별 제품이 아닙니다.
+`fimctl`은 지정한 실습 디렉터리에서 일반 파일의 SHA-256과 메타데이터 기준선을 만들고, `verify`와 inotify 감시로 이후 상태 변화를 관찰하는 교육용 도구입니다. 이 프로젝트는 디렉터리 FD 기반 순회, 안정적인 파일 해시, SQLite 트랜잭션, 이벤트 coalescing, 기준선 인식 hash debounce, 감시 범위 복구, Linux 이벤트 유실 한계를 설명하기 위해 제작했습니다. 변경을 차단하거나, 행위자를 식별하거나, 파일을 복구하는 보안 제품은 아닙니다.
 
-### 빌드 및 사용
+### 빌드
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
+ctest --test-dir build --output-on-failure
+```
+
+필요 항목: Linux, C17 컴파일러, CMake, OpenSSL libcrypto, SQLite3 개발 헤더.
+
+### 사용
+
+```sh
 mkdir -p "$HOME/fim-lab"
 ./build/fimctl init --root "$HOME/fim-lab" --db ./state.sqlite
 ./build/fimctl verify --db ./state.sqlite --full
-./build/fimctl watch --root "$HOME/fim-lab" --events ./events.ndjson
+./build/fimctl watch --root "$HOME/fim-lab" --db ./state.sqlite \
+  --events ./events.ndjson --pidfile ./fimd.pid --verify-interval-seconds 3600
 ```
 
-C17 컴파일러, CMake, OpenSSL libcrypto, SQLite 개발 헤더가 필요합니다. `init`은 기존 DB를 덮어쓰지 않습니다. `scan`은 기준선을 갱신하고, `verify`는 차이를 찾으면 종료 코드 2를 반환합니다. 감시 프로세스는 Ctrl-C 또는 `fimctl stop --pidfile ./fimd.pid`로 종료합니다.
+`init`은 이미 존재하는 DB를 덮어쓰지 않습니다. `scan`은 저장된 root를 다시 스캔해 기준선을 갱신하고, `verify`는 차이를 발견하면 종료 코드 2를 반환합니다. `watch`는 DB를 읽기 전용으로 열며 `--root`가 기준선 root와 일치해야 합니다. Ctrl-C 또는 `./build/fimctl stop --pidfile ./fimd.pid`로 종료할 수 있습니다. 주기 검사 간격은 1~86,400초이고 기본값은 3,600초입니다.
 
-### 검증 및 한계
+### 구현 및 검증 현황
 
-현재 Linux 호스트에서 GCC Release, Clang Release, ASan/UBSan CTest가 각각 1/1 통과했고 Clang 정적 분석도 경고 없이 끝났습니다. 스모크는 기준선 생성/비교, JSON 경로 내보내기, 심볼릭 링크 제외, 이벤트 burst coalescing과 원본 신호 수·시각 범위, rename 짝짓기·타임아웃, 신규 디렉터리 생성·이동 후 재감시, 큐 오버플로 주입 뒤 전체 재검사와 생성/삭제/메타데이터 차이 보고, PID 파일 종료를 확인합니다. 실제 커널 큐 오버플로, watch 자원 고갈, mount 경계, 동시 파일 변경, 디스크 오류, 10,000개 파일 성능, Ubuntu/Rocky 런타임 매트릭스는 확인하지 않았습니다.
+현재 Linux 호스트에서 GCC Release, Clang Release, Clang ASan/UBSan 빌드와 CTest가 각각 통과했습니다. Clang 정적 분석도 실행했습니다. 스모크는 기준선 생성/읽기 전용 startup 비교, 파일 생성·삭제·수정·메타데이터 변경의 해시 증거, 100ms coalescing과 관찰 수·시간 범위, 잘못된 검사 간격 거부, 주기 전체 검사, 합성 오버플로 뒤 `degraded → recovering → healthy`, rename 짝짓기·타임아웃, 디렉터리 재감시, PID 파일 종료를 확인합니다. CTest는 각 빌드 디렉터리의 실제 실행 파일을 사용합니다.
 
-스캔은 심볼릭 링크를 따라가지 않고 선택한 루트와 다른 장치의 파일을 제외합니다. 감시기는 256개 항목의 pending rename/coalescing 표와 100ms quiet window를 사용해 신호 burst를 묶고, `observation_count` 및 최초·마지막 관찰 시각을 기록합니다. rename 신호는 쿠키 짝짓기를 위해 즉시 별도 기록합니다. 큐 오버플로, 감시 무효화, 디렉터리 추가·이동 때 `recovering` 상태를 기록하고 감시 트리와 파일 상태를 다시 검사합니다. 전체 watch 등록과 스캔이 성공하면 `healthy`, 실패하면 `degraded`를 기록하며, 재검사 차이는 별도 reconciliation 증거로 남깁니다. `--inject-overflow-once`는 이 경로의 합성 회귀 테스트 전용이며 실제 커널 큐 오버플로 시험은 아닙니다. inotify 이벤트는 유실되거나 합쳐질 수 있고 프로세스 행위자를 알 수 없습니다. 기준선 비교를 위한 hash debounce와 주기적 전체 검사는 아직 없습니다. 데이터베이스와 로그는 같은 사용자 또는 root에 의한 변조를 막지 못합니다. 민감한 경로가 로그에 기록될 수 있으니 개인 파일 대신 폐기 가능한 실습 경로를 사용하세요.
+아직 검증하지 않은 항목은 실제 커널 inotify 큐 오버플로, watch 자원 고갈과 재시도, mount 경계, 동시 파일 변경 fault injection, event log 디스크 부족, 대규모 성능, Ubuntu/RockyOS 매트릭스입니다. 합성 오버플로 테스트는 커널에서 `IN_Q_OVERFLOW`를 발생시키지 않습니다. 따라서 저장소는 SRS 전체 완료가 아니라 구현 일부와 선택된 기술 게이트 통과 상태입니다.
 
-상세 설계와 한계는 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md), [`docs/TEST_RESULTS.md`](docs/TEST_RESULTS.md)를 참고하세요.
+### 동작과 보안 범위
+
+스캐너는 심볼릭 링크와 다른 장치의 파일시스템을 따라가지 않습니다. 감시기는 256개 항목의 메모리 내 이벤트 표와 100ms quiet window로 비-rename 신호를 합칩니다. quiet window 뒤에는 root FD 기준 `openat`으로 파일을 다시 열고, 해시 전후 `fstat` 상태가 안정적인지 확인한 뒤 시작 시 읽은 기준선/마지막 상태와 비교합니다. NDJSON에는 전후 SHA-256, 이벤트 신호 수·시간 범위, 오류 errno를 기록할 수 있습니다. 감시 중 SQLite 기준선은 변경하지 않습니다.
+
+오버플로, 감시 무효화, 디렉터리 트리 변경에는 recursive watch와 현재 상태를 다시 확인합니다. 또한 기본 1시간 간격의 주기 검사는 마지막 성공 스냅샷과 현재 트리를 비교합니다. 이 검사는 현재 상태를 찾을 뿐 중간에 일어난 모든 작업을 복원하지는 못합니다. 이벤트 loop와 해시 처리는 단일 스레드이며 전용 worker queue는 아직 없습니다. DB와 이벤트 로그는 같은 사용자 또는 root의 변조를 막지 못하고, 로그 경로에는 개인정보가 포함될 수 있습니다. 폐기 가능한 실습 경로에서 실행하세요.
+
+### 학습 자료
+
+`docs/ENGINEERING_STUDY_GUIDE.md`는 subsystem 목적과 보안 가정을, `docs/CODE_WALKTHROUGH.md`는 함수별 흐름과 자원 수명을, `docs/LINUX_INTERNALS_EXPLAINED.md`는 syscall·inotify 의미를 설명합니다. `docs/DEBUGGING_EXERCISES.md`에는 정답을 넣지 않은 세 가지 독립 구현 연습이 있고, `docs/TECHNICAL_INTERVIEW.md`에는 저장소별 기술 방어 질문이 있습니다. 자동 검증 결과는 소유자의 학습·재현 증거가 아닙니다.
 
 ## English
 
-`fimctl` is an educational, read-only file integrity monitor. It records a SHA-256 and metadata baseline for ordinary files beneath an explicitly selected lab directory, compares later scans, and writes local NDJSON observations from inotify. The project demonstrates descriptor-relative traversal, stable-file hashing, transactional SQLite storage, event-loss handling, and the limits of a best-effort Linux notification stream. It does not prevent changes, identify the process that made them, or recover files.
+`fimctl` is an educational tool that records SHA-256 and metadata baselines for ordinary files under an explicitly selected lab directory, then observes later state through `verify` and inotify. It was built to teach descriptor-relative traversal, stable file hashing, SQLite transactions, event coalescing, baseline-aware hash debounce, coverage recovery, and the limits of Linux event streams. It is not a prevention, actor-attribution, or file-recovery product.
 
-## Build
+### Build
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
+ctest --test-dir build --output-on-failure
 ```
 
-Dependencies: a C17 compiler, CMake, OpenSSL libcrypto, and SQLite3 development headers.
+Requirements: Linux, a C17 compiler, CMake, OpenSSL libcrypto, and SQLite3 development headers.
 
-## Use
+### Use
 
 ```sh
 mkdir -p "$HOME/fim-lab"
 ./build/fimctl init --root "$HOME/fim-lab" --db ./state.sqlite
 ./build/fimctl verify --db ./state.sqlite --full
-./build/fimctl watch --root "$HOME/fim-lab" --events ./events.ndjson
+./build/fimctl watch --root "$HOME/fim-lab" --db ./state.sqlite \
+  --events ./events.ndjson --pidfile ./fimd.pid --verify-interval-seconds 3600
 ```
 
-`init` refuses to replace an existing database. `scan` deliberately replaces the current baseline. `verify` returns 2 when it finds differences. Run `watch` in a separate terminal and stop it with Ctrl-C or `fimctl stop --pidfile ./fimd.pid`. `watch` coalesces non-rename signals for the same path over a bounded 100 ms quiet window and records signal count plus first/last observation timestamps. The explicit lab-only `--inject-overflow-once` option exercises reconciliation in tests; omit it during normal observation.
+`init` refuses to replace an existing database. `scan` refreshes the baseline for its stored root. `verify` returns exit code 2 when it finds differences. `watch` opens the database read-only and requires `--root` to match the baseline root. Stop it with Ctrl-C or `./build/fimctl stop --pidfile ./fimd.pid`. The verification interval accepts 1 through 86,400 seconds and defaults to 3,600 seconds.
 
-## Scope and limitations
+### Implementation and verification status
 
-Traversal refuses symlinks and skips filesystems mounted below the selected root during baseline scanning. A bounded table correlates rename cookies and coalesces other signals for each path over a 100 ms quiet window; the journal retains the combined mask, signal count, and first/last wall-clock nanoseconds. On queue overflow, invalidated watches, or directory-tree changes, the watcher records `recovering`, rebuilds recursive watches, scans current file state, emits reconciliation differences, and records `healthy` only when both operations succeed. The smoke test injects an overflow condition through a clearly named option; it does not force the kernel queue itself to overflow. Inotify does not identify the process that changed a file and can coalesce events in the kernel. Baseline-aware hash debounce, periodic verification, watch-limit fault injection, mount-boundary and concurrent-mutation tests, a 10k-file benchmark, and the Ubuntu/Rocky runtime matrix remain open. Export paths are local data and may contain personal information.
+GCC Release, Clang Release, and Clang ASan/UBSan builds and CTest passed on the current Linux host. Clang static analysis was also run. The smoke test covers baseline creation and read-only startup comparison; hashed evidence for create/delete/modify/metadata changes; the 100 ms coalescing window and signal count/time range; invalid interval rejection; a periodic full scan; synthetic `degraded → recovering → healthy` overflow recovery; rename pairing and timeout; recursive watch recovery; and PID-file shutdown. CTest uses the executable from the build directory under test.
 
-Supported target is a Linux filesystem and an unprivileged lab directory. No Ubuntu/Rocky runtime matrix has been executed. Run `ctest --test-dir build --output-on-failure`; the smoke test covers baseline creation/comparison, JSON path escaping, symlink exclusion, coalesced event bursts, paired and unmatched rename observations, move timeout, recursive watch recovery, synthetic overflow reconciliation, and monitor shutdown. See `docs/TEST_RESULTS.md` for the evidence and remaining gates.
+Still unverified: genuine kernel inotify queue overflow, watch-resource exhaustion and retry, mount boundaries, concurrent-mutation fault injection, event-log disk-full behavior, large-tree performance, and the Ubuntu/RockyOS matrix. The synthetic overflow test does not make the kernel emit `IN_Q_OVERFLOW`. This repository has passed selected technical gates; it is not a complete SRS implementation.
 
-## Safety
+### Behavior and security scope
 
-The program never modifies monitored files. It is not a complete audit log, does not attribute process actors, does not protect its database from a privileged attacker, and does not provide a point-in-time filesystem snapshot.
+The scanner does not follow symlinks or cross to another device. The watcher uses a bounded 256-entry in-memory event table and a 100 ms quiet window to coalesce non-rename signals. After the quiet window, it reopens the path relative to the root FD with `openat`, checks pre/post `fstat` state around hashing, and compares the result with the baseline/last accepted state loaded at startup. NDJSON can include before/after SHA-256 values, the raw signal count and time range, and an error errno. The watcher does not update the SQLite baseline.
+
+Overflow, invalidated watches, and directory-tree changes trigger recursive watch recovery and a current-state scan. A periodic scan also compares the current tree with the last successful in-memory snapshot; its default interval is one hour. These scans recover current state, not every action that happened between scans. The event loop and hashing are single-threaded; a dedicated worker queue is not implemented. The database and journal are not protected from the same user or root, and logged paths may contain personal information. Use a disposable lab tree.
+
+### Study materials
+
+`docs/ENGINEERING_STUDY_GUIDE.md` explains subsystem purpose and security assumptions; `docs/CODE_WALKTHROUGH.md` follows functions and resource lifetimes; `docs/LINUX_INTERNALS_EXPLAINED.md` explains syscall and inotify behavior. `docs/DEBUGGING_EXERCISES.md` contains three independent exercises without solutions, and `docs/TECHNICAL_INTERVIEW.md` contains repository-specific defense questions. Automated verification is not evidence of the owner's personal study or reproduction.

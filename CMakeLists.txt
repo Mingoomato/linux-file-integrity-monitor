@@ -15,5 +15,5 @@ install(TARGETS fimctl RUNTIME DESTINATION bin)
 
 include(CTest)
 if(BUILD_TESTING)
-    add_test(NAME fim-smoke COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke.sh)
+    add_test(NAME fim-smoke COMMAND ${CMAKE_COMMAND} -E env BIN_DIR=$<TARGET_FILE_DIR:fimctl> ${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke.sh)
 endif()
