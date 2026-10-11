@@ -9,5 +9,15 @@
   },
   "owner_mastery": "unassessed",
   "remote_ci": "blocked_before_execution_account_billing_or_spending_limit",
-  "remote_ci_url": "https://github.com/Mingoomato/linux-file-integrity-monitor/actions/runs/38107484037"
+  "remote_ci_url": "https://github.com/Mingoomato/linux-file-integrity-monitor/actions/runs/38107484037",
+  "local_followup": {
+    "date": "2026-10-11",
+    "host": "Kali Linux 7.1.5+kali-amd64 x86_64",
+    "gcc_release_ctest": "1/1 pass",
+    "clang_release_ctest": "1/1 pass",
+    "clang_asan_ubsan": "1/1 CTest pass",
+    "fuzz_smoke_requested_runs": null,
+    "kernel_module_compile": "not_applicable",
+    "full_srs_status": "pending"
+  }
 }
