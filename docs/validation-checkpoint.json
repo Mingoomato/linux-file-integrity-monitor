@@ -8,5 +8,6 @@
     "src/fimctl.c": "b560c4ede31b6764a44b74d5a5c6c73686dd5f7daa9c67cf9cfc1f6c49e54911"
   },
   "owner_mastery": "unassessed",
-  "remote_ci": "new_workflow_pending_remote_run"
+  "remote_ci": "blocked_before_execution_account_billing_or_spending_limit",
+  "remote_ci_url": "https://github.com/Mingoomato/linux-file-integrity-monitor/actions/runs/38107484037"
 }
