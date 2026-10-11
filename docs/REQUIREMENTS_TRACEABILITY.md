@@ -1,5 +1,7 @@
 # Requirements traceability (SRS-01)
 
+Latest scoped evidence: [2026-10-11 validation checkpoint](VALIDATION_CHECKPOINT.md). Historical pending/unverified rows below remain applicable to gates not exercised by that checkpoint.
+
 Code presence is not full requirement verification. The recorded smoke test covers selected baseline and watcher flows; scenarios outside that test remain open. See `docs/TEST_RESULTS.md`.
 
 | Requirement | Source / artifact | Verification | Status |

@@ -1,5 +1,7 @@
 # Linux File Integrity Monitor
 
+[검토 안내 / Reviewer guide](docs/PORTFOLIO_REVIEW.md) · [최신 검증 / Latest checkpoint](docs/VALIDATION_CHECKPOINT.md)
+
 [:kr: 한국어](#한국어) · [:us: English](#english)
 
 ## 한국어

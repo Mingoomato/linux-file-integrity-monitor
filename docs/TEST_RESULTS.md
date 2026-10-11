@@ -1,5 +1,7 @@
 # Test results
 
+> Latest / 최신: [2026-10-11 checkpoint](VALIDATION_CHECKPOINT.md). Earlier entries below describe their own historical revisions; they do not override this scoped checkpoint.
+
 Status: selected FIM verification gates passed on the current Linux host. Full SRS-01 acceptance remains incomplete.
 
 Environment recorded for this run: Kali GNU/Linux Rolling 2026.3, x86_64, Linux `7.1.5+kali-amd64`; GCC 16.2.0, Clang 21.1.8, CMake 4.4.3, OpenSSL 3.6.3, SQLite 3.53.4.
